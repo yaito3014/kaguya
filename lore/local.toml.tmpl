@@ -25,7 +25,12 @@ pkey_file = "/caddy-certs/caddy/certificates/acme-v02.api.letsencrypt.org-direct
 enabled = true
 
 [environment.endpoint]
-auth_url = "https://{{DEX_HOST}}/dex"
+# auth_url omitted on purpose. With it set, repository_authorizer builds a
+# ReBAC AuthClientAuthorizer that calls create_resource on the auth service
+# (UCS), which Dex does not provide (404 on `lore repository create`).
+# Omitting it selects AllowAllRepositoryAuthorizer: any JWT-authenticated
+# user gets full access. Restore it once a real ReBAC auth service exists.
+# auth_url = "https://{{DEX_HOST}}/dex"
 repository_url = "lore://{{LORE_HOST}}:41337"
 storage_url = "lore://{{LORE_HOST}}:41337"
 revision_url = "lore://{{LORE_HOST}}:41337"
