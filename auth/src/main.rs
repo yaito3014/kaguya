@@ -194,12 +194,29 @@ impl UrcAuthApi for Auth {
         })?;
 
         let resource_ids = req.into_inner().resource_id;
+        // Display fields carried from the verified Dex identity. The lore CLI
+        // requires `name` when it decodes the exchanged token, so fall back to
+        // the username/email/subject rather than leaving it empty.
+        let name = claims
+            .name
+            .clone()
+            .or_else(|| claims.preferred_username.clone())
+            .or_else(|| claims.email.clone())
+            .unwrap_or_else(|| claims.sub.clone());
+        let preferred_username = claims
+            .preferred_username
+            .clone()
+            .or_else(|| claims.email.clone())
+            .unwrap_or_else(|| name.clone());
+
         let minted = self
             .signer
             .mint(
                 &self.auth_issuer,
                 &self.audience,
                 &claims.sub,
+                &name,
+                &preferred_username,
                 claims.exp,
                 &resource_ids,
             )
@@ -208,11 +225,7 @@ impl UrcAuthApi for Auth {
                 Status::internal("token issuance failed")
             })?;
 
-        let user_name = claims
-            .preferred_username
-            .or(claims.name)
-            .or(claims.email)
-            .unwrap_or_default();
+        let user_name = name.clone();
 
         Ok(Response::new(
             ExchangeUserTokenForMultiresourceTokenResponse {

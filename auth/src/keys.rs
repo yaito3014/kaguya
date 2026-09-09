@@ -50,8 +50,11 @@ pub struct ResourceGrant {
 }
 
 /// Claims of a minted Lore token. Mirrors the subset of Lore's
-/// `AuthorizationToken` that its verification reads: the registered claims plus
-/// the `resources` grant list.
+/// `AuthorizationToken` that its verification reads (the registered claims plus
+/// the `resources` grant list), and carries the display claims the lore CLI
+/// requires when it decodes the exchanged token: `name`, `preferred_username`
+/// and `is_service_account` (the deployed CLI treats `name` as mandatory, so we
+/// always emit it — carried over from the verified Dex identity).
 #[derive(Serialize, Deserialize, Debug)]
 pub struct MintedClaims {
     pub iss: String,
@@ -59,6 +62,9 @@ pub struct MintedClaims {
     pub aud: Vec<String>,
     pub iat: u64,
     pub exp: u64,
+    pub name: String,
+    pub preferred_username: String,
+    pub is_service_account: bool,
     pub resources: Vec<ResourceGrant>,
 }
 
@@ -114,13 +120,18 @@ impl Signer {
         &self.own_jwk
     }
 
-    /// Mint a Lore token for `subject`, scoped to `resource_ids` (each already in
-    /// `urc-{repository}` form as the client requested), expiring at `exp`.
+    /// Mint a Lore token for `subject` (with the display `name` and
+    /// `preferred_username` carried from the verified identity), scoped to
+    /// `resource_ids` (each already in `urc-{repository}` form as the client
+    /// requested), expiring at `exp`.
+    #[allow(clippy::too_many_arguments)]
     pub fn mint(
         &self,
         issuer: &str,
         audience: &str,
         subject: &str,
+        name: &str,
+        preferred_username: &str,
         exp: u64,
         resource_ids: &[String],
     ) -> Result<String, BoxError> {
@@ -130,6 +141,9 @@ impl Signer {
             aud: vec![audience.to_string()],
             iat: now_secs(),
             exp,
+            name: name.to_string(),
+            preferred_username: preferred_username.to_string(),
+            is_service_account: false,
             resources: resource_ids.iter().map(|id| grant(id.clone())).collect(),
         };
         let mut header = Header::new(Algorithm::RS256);
@@ -209,7 +223,9 @@ mod tests {
         let resources = vec!["urc-abc".to_string(), "urc-def".to_string()];
         let exp = now_secs() + 3600;
 
-        let token = signer.mint(ISS, AUD, "user-1", exp, &resources).unwrap();
+        let token = signer
+            .mint(ISS, AUD, "user-1", "User One", "user1", exp, &resources)
+            .unwrap();
         let data = decode::<MintedClaims>(&token, &decoding_key(&signer), &validation())
             .expect("minted token must verify against its own JWK");
 
@@ -217,6 +233,9 @@ mod tests {
         assert_eq!(data.claims.aud, vec![AUD.to_string()]);
         assert_eq!(data.claims.sub, "user-1");
         assert_eq!(data.claims.exp, exp);
+        // The deployed lore CLI requires `name` when it decodes the exchanged token.
+        assert_eq!(data.claims.name, "User One");
+        assert_eq!(data.claims.preferred_username, "user1");
         let ids: Vec<&str> = data
             .claims
             .resources
@@ -238,7 +257,7 @@ mod tests {
         let signer = signer();
         let repo = "urc-0194b726b34e72b0b45550b88a967076".to_string();
         let token = signer
-            .mint(ISS, AUD, "u", now_secs() + 60, std::slice::from_ref(&repo))
+            .mint(ISS, AUD, "u", "U", "u", now_secs() + 60, std::slice::from_ref(&repo))
             .unwrap();
         let data = decode::<MintedClaims>(&token, &decoding_key(&signer), &validation()).unwrap();
         assert!(data.claims.resources.iter().any(|r| r.resource_id == repo));
@@ -248,7 +267,7 @@ mod tests {
     fn wrong_audience_is_rejected() {
         let signer = signer();
         let token = signer
-            .mint(ISS, "someone-else", "u", now_secs() + 60, &["urc-x".into()])
+            .mint(ISS, "someone-else", "u", "U", "u", now_secs() + 60, &["urc-x".into()])
             .unwrap();
         decode::<MintedClaims>(&token, &decoding_key(&signer), &validation())
             .expect_err("a token minted for another audience must not verify");
@@ -258,7 +277,7 @@ mod tests {
     fn expired_token_is_rejected() {
         let signer = signer();
         let token = signer
-            .mint(ISS, AUD, "u", now_secs() - 3600, &["urc-x".into()])
+            .mint(ISS, AUD, "u", "U", "u", now_secs() - 3600, &["urc-x".into()])
             .unwrap();
         decode::<MintedClaims>(&token, &decoding_key(&signer), &validation())
             .expect_err("an expired token must not verify");
