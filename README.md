@@ -34,9 +34,11 @@ machine and transfer if this VPS is small:
     ./setup.sh            # renders caddy + lore configs
     docker compose up -d
 
-Users get tokens via the OAuth 2.0 device flow against Dex, then
-`lore auth login --token-type lore`. Interactive login and refresh need UCS and
-do not work through Dex, so the device-flow helper is the supported path.
+Interactive login and refresh need UCS and do not work through Dex, so use the
+device-flow helper `examples/get-token.sh` to get a token, then hand it to the CLI:
+
+    TOKEN=$(./examples/get-token.sh)
+    lore auth login --token-type lore --token "$TOKEN" --auth-url https://dex.yai.to/dex lore://lore.yai.to:41337
 
 ## Notes
 
