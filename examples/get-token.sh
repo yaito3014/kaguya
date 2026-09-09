@@ -6,8 +6,7 @@
 #
 # Usage:
 #   TOKEN=$(./get-token.sh)
-#   lore auth login --token-type lore --token "$TOKEN" \
-#     --auth-url https://dex.yai.to/dex lore://lore.yai.to:41337
+#   lore auth login --token-type lore --token "$TOKEN" lore://lore.yai.to:41337
 #
 # Override the defaults with env vars if needed:
 #   DEX_URL (default https://dex.yai.to/dex), LORE_CLIENT_ID (default lore.yai.to)

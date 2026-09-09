@@ -38,7 +38,7 @@ Interactive login and refresh need UCS and do not work through Dex, so use the
 device-flow helper `examples/get-token.sh` to get a token, then hand it to the CLI:
 
     TOKEN=$(./examples/get-token.sh)
-    lore auth login --token-type lore --token "$TOKEN" --auth-url https://dex.yai.to/dex lore://lore.yai.to:41337
+    lore auth login --token-type lore --token "$TOKEN" lore://lore.yai.to:41337
 
 ## Notes
 
