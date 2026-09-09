@@ -4,3 +4,9 @@
     # LORE_HOST. Lore's real traffic is QUIC (UDP 41337) and bypasses Caddy.
     reverse_proxy lore:41339
 }
+
+{{LORE_AUTH_HOST}} {
+    # gRPC (h2c) to the internal auth service: UCS-compatible token exchange
+    # for the lore CLI and ReBAC for loreserver. Caddy terminates TLS here.
+    reverse_proxy h2c://auth:8080
+}

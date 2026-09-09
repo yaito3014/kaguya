@@ -30,7 +30,7 @@ enabled = true
 # service for create_resource / check_user_permission, so clients send their
 # token (authentication works) and the service grants every action.
 # Authentication itself is still enforced by [server.auth] above.
-auth_url = "http://auth:8080"
+auth_url = "https://{{LORE_AUTH_HOST}}"
 repository_url = "lore://{{LORE_HOST}}:41337"
 storage_url = "lore://{{LORE_HOST}}:41337"
 revision_url = "lore://{{LORE_HOST}}:41337"

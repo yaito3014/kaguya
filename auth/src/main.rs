@@ -4,6 +4,7 @@
 // Authentication is enforced upstream by loreserver's [server.auth] JWT check;
 // this service grants every action to any request that reaches it, so it must
 // stay on the internal compose network only.
+use base64::Engine;
 use tonic::{transport::Server, Request, Response, Status};
 
 pub mod ucs_auth {
@@ -29,6 +30,27 @@ fn grant(resource_id: String) -> ResourcePermission {
         resource_id,
         permission: ALL_ACTIONS.iter().map(|s| s.to_string()).collect(),
     }
+}
+
+// Pull the bearer token out of the request's authorization metadata.
+fn bearer<T>(req: &Request<T>) -> String {
+    req.metadata()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .unwrap_or("")
+        .to_string()
+}
+
+// Read the `exp` claim from a JWT without verifying the signature (loreserver's
+// [server.auth] does the real verification). Returns 0 if it can't be parsed.
+fn jwt_exp(token: &str) -> i64 {
+    let Some(payload) = token.split('.').nth(1) else { return 0 };
+    let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload) else {
+        return 0;
+    };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return 0 };
+    v.get("exp").and_then(|e| e.as_i64()).unwrap_or(0)
 }
 
 #[derive(Default)]
@@ -129,9 +151,21 @@ impl UrcAuthApi for Auth {
     }
     async fn exchange_user_token_for_multiresource_token(
         &self,
-        _req: Request<ExchangeUserTokenForMultiresourceTokenRequest>,
+        req: Request<ExchangeUserTokenForMultiresourceTokenRequest>,
     ) -> Result<Response<ExchangeUserTokenForMultiresourceTokenResponse>, Status> {
-        Err(Status::unimplemented("exchange_user_token_for_multiresource_token"))
+        // Pass-through: hand the caller's own JWT back as the multiresource
+        // token. loreserver re-verifies it via [server.auth]; authorization is
+        // granted separately by check_user_permission.
+        let token = bearer(&req);
+        let expires_at = jwt_exp(&token);
+        Ok(Response::new(ExchangeUserTokenForMultiresourceTokenResponse {
+            token: Some(UserToken {
+                user_token: token,
+                expires_at,
+                user_id: String::new(),
+                user_name: String::new(),
+            }),
+        }))
     }
     async fn get_user_id(
         &self,
