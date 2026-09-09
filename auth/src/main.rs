@@ -1,11 +1,35 @@
-// kaguya-auth: minimal all-allow ReBAC/auth service for Lore.
-// Implements the four methods loreserver actually calls (RebacApi.CreateResource
-// / DeleteResource, UrcAuthApi.CheckUserPermission / LookupUserPermissions).
-// Authentication is enforced upstream by loreserver's [server.auth] JWT check;
-// this service grants every action to any request that reaches it, so it must
-// stay on the internal compose network only.
-use base64::Engine;
+// kaguya-auth: auth/ReBAC service for a Dex-fronted Lore server.
+//
+// Lore expects a UCS-style auth service for two things this fills:
+//   - the ReBAC gRPC API loreserver calls to create/authorize resources
+//     (RebacApi + UrcAuthApi.CheckUserPermission / LookupUserPermissions), and
+//   - token exchange: the client presents its Dex identity token here and
+//     receives a "multiresource" token that loreserver's storage/revision
+//     authorization accepts.
+//
+// The exchange is the load-bearing part. loreserver's `verify_authorization`
+// requires the presented token to carry a `resources` claim naming the
+// repository (`urc-{id}`); a plain Dex token has none. So we verify the Dex
+// token (signature/issuer/audience/expiry, see `verify`) and then MINT a fresh
+// RS256 token that carries the requested resource grants, signed with our own
+// key (see `keys`). loreserver trusts us as the issuer of exchanged tokens via
+// `[server.auth].jwt_issuer` + `[server.auth.jwk].endpoint = file://` pointing at
+// the JWKS we publish to the shared volume.
+//
+// The ReBAC methods still grant every action to any caller; real per-repository
+// policy can be added there later. Authentication is enforced both by our Dex
+// verification above and by loreserver's own JWT check.
+use std::error::Error;
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use tonic::{transport::Server, Request, Response, Status};
+
+mod keys;
+mod verify;
+
+use keys::Signer;
+use verify::DexVerifier;
 
 pub mod ucs_auth {
     include!(concat!(env!("OUT_DIR"), "/ucs.auth.rs"));
@@ -14,21 +38,22 @@ pub mod epic_urc {
     include!(concat!(env!("OUT_DIR"), "/epic_urc.rs"));
 }
 
+use epic_urc::urc_auth_api_server::{UrcAuthApi, UrcAuthApiServer};
+use epic_urc::*;
 use ucs_auth::rebac_api_server::{RebacApi, RebacApiServer};
 use ucs_auth::{
     CreateResourceRequest, CreateResourceResponse, DeleteResourceRequest, DeleteResourceResponse,
 };
-use epic_urc::urc_auth_api_server::{UrcAuthApi, UrcAuthApiServer};
-use epic_urc::*;
 
-// Actions loreserver names in check_repository_access; everything else is an
-// existence check (action = None), satisfied by returning the resource_id.
-const ALL_ACTIONS: &[&str] = &["obliterate", "presign"];
+type BoxError = Box<dyn Error + Send + Sync>;
 
+// A proto ResourcePermission granting every action on `resource_id`, for the
+// ReBAC permission-check responses (distinct from the JWT resource grants in
+// `keys`, which are a different, serialized type).
 fn grant(resource_id: String) -> ResourcePermission {
     ResourcePermission {
         resource_id,
-        permission: ALL_ACTIONS.iter().map(|s| s.to_string()).collect(),
+        permission: keys::ALL_ACTIONS.iter().map(|s| s.to_string()).collect(),
     }
 }
 
@@ -40,17 +65,6 @@ fn bearer<T>(req: &Request<T>) -> String {
         .and_then(|s| s.strip_prefix("Bearer "))
         .unwrap_or("")
         .to_string()
-}
-
-// Read the `exp` claim from a JWT without verifying the signature (loreserver's
-// [server.auth] does the real verification). Returns 0 if it can't be parsed.
-fn jwt_exp(token: &str) -> i64 {
-    let Some(payload) = token.split('.').nth(1) else { return 0 };
-    let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload) else {
-        return 0;
-    };
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return 0 };
-    v.get("exp").and_then(|e| e.as_i64()).unwrap_or(0)
 }
 
 #[derive(Default)]
@@ -72,8 +86,14 @@ impl RebacApi for Rebac {
     }
 }
 
-#[derive(Default)]
-struct Auth;
+struct Auth {
+    signer: Arc<Signer>,
+    dex: Arc<DexVerifier>,
+    /// `iss` stamped on minted tokens; must equal loreserver's `jwt_issuer`.
+    auth_issuer: String,
+    /// `aud` stamped on minted tokens; must be in loreserver's `jwt_audience`.
+    audience: String,
+}
 
 #[tonic::async_trait]
 impl UrcAuthApi for Auth {
@@ -81,7 +101,9 @@ impl UrcAuthApi for Auth {
         &self,
         _req: Request<HealthCheckRequest>,
     ) -> Result<Response<HealthCheckResponse>, Status> {
-        Ok(Response::new(HealthCheckResponse { status: "ok".into() }))
+        Ok(Response::new(HealthCheckResponse {
+            status: "ok".into(),
+        }))
     }
 
     async fn check_user_permission(
@@ -141,7 +163,9 @@ impl UrcAuthApi for Auth {
         &self,
         _req: Request<ExchangeExternalTokenForUserTokenRequest>,
     ) -> Result<Response<ExchangeExternalTokenForUserTokenResponse>, Status> {
-        Err(Status::unimplemented("exchange_external_token_for_user_token"))
+        Err(Status::unimplemented(
+            "exchange_external_token_for_user_token",
+        ))
     }
     async fn exchange_api_key_for_user_token(
         &self,
@@ -149,24 +173,58 @@ impl UrcAuthApi for Auth {
     ) -> Result<Response<ExchangeApiKeyForUserTokenResponse>, Status> {
         Err(Status::unimplemented("exchange_api_key_for_user_token"))
     }
+
+    /// Verify the caller's Dex token, then mint a Lore token scoped to the
+    /// requested resources. This is what makes `clone`/`push` authorize: the
+    /// minted token carries the `resources` grants loreserver's storage and
+    /// revision services require.
     async fn exchange_user_token_for_multiresource_token(
         &self,
         req: Request<ExchangeUserTokenForMultiresourceTokenRequest>,
     ) -> Result<Response<ExchangeUserTokenForMultiresourceTokenResponse>, Status> {
-        // Pass-through: hand the caller's own JWT back as the multiresource
-        // token. loreserver re-verifies it via [server.auth]; authorization is
-        // granted separately by check_user_permission.
         let token = bearer(&req);
-        let expires_at = jwt_exp(&token);
-        Ok(Response::new(ExchangeUserTokenForMultiresourceTokenResponse {
-            token: Some(UserToken {
-                user_token: token,
-                expires_at,
-                user_id: String::new(),
-                user_name: String::new(),
-            }),
-        }))
+        if token.is_empty() {
+            return Err(Status::unauthenticated("missing bearer token"));
+        }
+
+        let claims = self.dex.verify(&token).await.map_err(|e| {
+            eprintln!("exchange: rejecting identity token: {e}");
+            Status::unauthenticated("invalid identity token")
+        })?;
+
+        let resource_ids = req.into_inner().resource_id;
+        let minted = self
+            .signer
+            .mint(
+                &self.auth_issuer,
+                &self.audience,
+                &claims.sub,
+                claims.exp,
+                &resource_ids,
+            )
+            .map_err(|e| {
+                eprintln!("exchange: minting token failed: {e}");
+                Status::internal("token issuance failed")
+            })?;
+
+        let user_name = claims
+            .preferred_username
+            .or(claims.name)
+            .or(claims.email)
+            .unwrap_or_default();
+
+        Ok(Response::new(
+            ExchangeUserTokenForMultiresourceTokenResponse {
+                token: Some(UserToken {
+                    user_token: minted,
+                    expires_at: claims.exp as i64,
+                    user_id: claims.sub,
+                    user_name,
+                }),
+            },
+        ))
     }
+
     async fn get_user_id(
         &self,
         _req: Request<GetUserIdRequest>,
@@ -181,13 +239,36 @@ impl UrcAuthApi for Auth {
     }
 }
 
+fn env_required(key: &str) -> Result<String, BoxError> {
+    std::env::var(key).map_err(|_| format!("missing required env var {key}").into())
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), BoxError> {
+    let dex_issuer = env_required("KAGUYA_DEX_ISSUER")?;
+    let audience = env_required("KAGUYA_JWT_AUDIENCE")?;
+    let auth_issuer = env_required("KAGUYA_AUTH_ISSUER")?;
+    let keys_dir = PathBuf::from(std::env::var("KAGUYA_KEYS_DIR").unwrap_or_else(|_| "/keys".into()));
+
+    let signer = Arc::new(Signer::load_or_generate(&keys_dir)?);
+    let dex = Arc::new(DexVerifier::new(dex_issuer.clone(), audience.clone()));
+
+    let auth = Auth {
+        signer: signer.clone(),
+        dex,
+        auth_issuer: auth_issuer.clone(),
+        audience: audience.clone(),
+    };
+
     let addr = "0.0.0.0:8080".parse()?;
-    println!("kaguya-auth listening on {addr}");
+    println!(
+        "kaguya-auth listening on {addr}; issuer={auth_issuer}, audience={audience}, \
+         verifying Dex tokens from {dex_issuer}, kid={}",
+        signer.kid
+    );
     Server::builder()
         .add_service(RebacApiServer::new(Rebac))
-        .add_service(UrcAuthApiServer::new(Auth))
+        .add_service(UrcAuthApiServer::new(auth))
         .serve(addr)
         .await?;
     Ok(())

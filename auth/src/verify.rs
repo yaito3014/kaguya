@@ -1,0 +1,302 @@
+// Verification of the incoming Dex identity token.
+//
+// The client presents its Dex-issued token as the bearer credential on the
+// exchange call. Before minting a Lore token for that identity we verify the Dex
+// token's signature (against Dex's JWKS), issuer, audience and expiry, so a
+// forged or foreign bearer cannot obtain a repository-scoped Lore token.
+//
+// The JWKS is fetched via OIDC discovery against the issuer and cached; a token
+// whose `kid` is not cached triggers a single refetch (covering key rotation).
+use std::error::Error;
+use std::fmt;
+
+use jsonwebtoken::decode;
+use jsonwebtoken::decode_header;
+use jsonwebtoken::jwk::JwkSet;
+use jsonwebtoken::Algorithm;
+use jsonwebtoken::DecodingKey;
+use jsonwebtoken::Validation;
+use serde::Deserialize;
+use tokio::sync::RwLock;
+
+/// The claims we read off a verified Dex token. `sub`/`exp` carry into the minted
+/// Lore token; the optional display fields populate the exchange response.
+#[derive(Deserialize, Debug)]
+pub struct DexClaims {
+    pub sub: String,
+    pub exp: u64,
+    #[serde(default)]
+    pub preferred_username: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub email: Option<String>,
+}
+
+#[derive(Debug)]
+pub enum VerifyError {
+    /// The bearer is not a well-formed JWT, or carries no `kid`.
+    Malformed(String),
+    /// No key with the token's `kid` in Dex's JWKS, even after a refresh.
+    UnknownKid(String),
+    /// Dex's JWKS could not be fetched or parsed.
+    Jwks(String),
+    /// Signature, issuer, audience or expiry did not check out.
+    Invalid(String),
+}
+
+impl fmt::Display for VerifyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            VerifyError::Malformed(m) => write!(f, "malformed token: {m}"),
+            VerifyError::UnknownKid(kid) => write!(f, "no Dex key for kid {kid}"),
+            VerifyError::Jwks(m) => write!(f, "Dex JWKS unavailable: {m}"),
+            VerifyError::Invalid(m) => write!(f, "token rejected: {m}"),
+        }
+    }
+}
+
+impl Error for VerifyError {}
+
+#[derive(Deserialize)]
+struct DiscoveryDoc {
+    jwks_uri: String,
+}
+
+pub struct DexVerifier {
+    issuer: String,
+    audience: String,
+    client: reqwest::Client,
+    jwks: RwLock<Option<JwkSet>>,
+}
+
+impl DexVerifier {
+    pub fn new(issuer: String, audience: String) -> Self {
+        DexVerifier {
+            issuer,
+            audience,
+            client: reqwest::Client::new(),
+            jwks: RwLock::new(None),
+        }
+    }
+
+    /// Verify a Dex bearer token, refetching the JWKS once if the token's key id
+    /// is not already cached.
+    pub async fn verify(&self, token: &str) -> Result<DexClaims, VerifyError> {
+        let kid = decode_header(token)
+            .map_err(|e| VerifyError::Malformed(e.to_string()))?
+            .kid
+            .ok_or_else(|| VerifyError::Malformed("no kid in header".into()))?;
+
+        if let Some(jwks) = self.jwks.read().await.as_ref() {
+            if jwks.find(&kid).is_some() {
+                return verify_with_jwks(token, jwks, &self.issuer, &self.audience);
+            }
+        }
+
+        let fetched = self.fetch_jwks().await?;
+        let result = verify_with_jwks(token, &fetched, &self.issuer, &self.audience);
+        *self.jwks.write().await = Some(fetched);
+        result
+    }
+
+    async fn fetch_jwks(&self) -> Result<JwkSet, VerifyError> {
+        let discovery_url = format!("{}/.well-known/openid-configuration", self.issuer);
+        let discovery: DiscoveryDoc = self
+            .client
+            .get(&discovery_url)
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| VerifyError::Jwks(format!("discovery {discovery_url}: {e}")))?
+            .json()
+            .await
+            .map_err(|e| VerifyError::Jwks(format!("discovery parse: {e}")))?;
+
+        self.client
+            .get(&discovery.jwks_uri)
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| VerifyError::Jwks(format!("jwks {}: {e}", discovery.jwks_uri)))?
+            .json()
+            .await
+            .map_err(|e| VerifyError::Jwks(format!("jwks parse: {e}")))
+    }
+}
+
+/// Verify a token against an already-resolved JWKS. Pure: no I/O, no caching, so
+/// the verification rules are testable without a live Dex.
+pub fn verify_with_jwks(
+    token: &str,
+    jwks: &JwkSet,
+    issuer: &str,
+    audience: &str,
+) -> Result<DexClaims, VerifyError> {
+    let kid = decode_header(token)
+        .map_err(|e| VerifyError::Malformed(e.to_string()))?
+        .kid
+        .ok_or_else(|| VerifyError::Malformed("no kid in header".into()))?;
+
+    let jwk = jwks
+        .find(&kid)
+        .ok_or_else(|| VerifyError::UnknownKid(kid.clone()))?;
+    let key =
+        DecodingKey::from_jwk(jwk).map_err(|e| VerifyError::Jwks(format!("bad jwk {kid}: {e}")))?;
+
+    // The key type is fixed by the JWK (RSA), and the algorithm is pinned to
+    // RS256 here rather than taken from the token header, so a token cannot pick
+    // its own algorithm (the classic RSA/HMAC confusion).
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.set_issuer(&[issuer]);
+    validation.set_audience(&[audience]);
+    validation.validate_exp = true;
+
+    decode::<DexClaims>(token, &key, &validation)
+        .map(|data| data.claims)
+        .map_err(|e| VerifyError::Invalid(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use jsonwebtoken::encode;
+    use jsonwebtoken::EncodingKey;
+    use jsonwebtoken::Header;
+    use rsa::pkcs1::EncodeRsaPublicKey;
+    use rsa::pkcs8::EncodePrivateKey;
+    use rsa::pkcs8::LineEnding;
+    use rsa::traits::PublicKeyParts;
+    use rsa::RsaPrivateKey;
+    use rsa::RsaPublicKey;
+    use serde_json::json;
+    use std::time::SystemTime;
+    use std::time::UNIX_EPOCH;
+
+    const ISS: &str = "https://dex.example.com/dex";
+    const AUD: &str = "lore.example.com";
+    const KID: &str = "test-key";
+
+    // A stand-in Dex: an RSA key, plus the JWKS that publishes it. Kept entirely
+    // local so the verification rules are exercised without a network.
+    struct FakeIdp {
+        encoding: EncodingKey,
+        jwks: JwkSet,
+    }
+
+    fn fake_idp() -> FakeIdp {
+        let mut rng = rand::thread_rng();
+        let private = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let public = RsaPublicKey::from(&private);
+        let pem = private.to_pkcs8_pem(LineEnding::LF).unwrap().to_string();
+        // Round-trip through PKCS#1 to confirm we could, but the JWKS is built
+        // from the raw components, matching what a real provider serves.
+        let _ = public.to_pkcs1_der().unwrap();
+
+        let n = URL_SAFE_NO_PAD.encode(public.n().to_bytes_be());
+        let e = URL_SAFE_NO_PAD.encode(public.e().to_bytes_be());
+        let jwks: JwkSet = serde_json::from_value(json!({
+            "keys": [{"kty": "RSA", "use": "sig", "alg": "RS256", "kid": KID, "n": n, "e": e}]
+        }))
+        .unwrap();
+
+        FakeIdp {
+            encoding: EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap(),
+            jwks,
+        }
+    }
+
+    fn now() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    fn sign(idp: &FakeIdp, claims: serde_json::Value) -> String {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(KID.to_string());
+        encode(&header, &claims, &idp.encoding).unwrap()
+    }
+
+    fn valid_claims() -> serde_json::Value {
+        json!({"iss": ISS, "aud": AUD, "sub": "abc-123", "exp": now() + 3600, "iat": now()})
+    }
+
+    #[test]
+    fn valid_dex_token_is_accepted() {
+        let idp = fake_idp();
+        let token = sign(&idp, valid_claims());
+        let claims = verify_with_jwks(&token, &idp.jwks, ISS, AUD).expect("valid token accepted");
+        assert_eq!(claims.sub, "abc-123");
+    }
+
+    #[test]
+    fn tampered_signature_is_rejected() {
+        let idp = fake_idp();
+        let mut token = sign(&idp, valid_claims());
+        // Flip the last signature character.
+        let last = token.pop().unwrap();
+        token.push(if last == 'A' { 'B' } else { 'A' });
+        assert!(matches!(
+            verify_with_jwks(&token, &idp.jwks, ISS, AUD),
+            Err(VerifyError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn wrong_audience_is_rejected() {
+        let idp = fake_idp();
+        let token = sign(&idp, json!({"iss": ISS, "aud": "other", "sub": "s", "exp": now() + 60}));
+        assert!(matches!(
+            verify_with_jwks(&token, &idp.jwks, ISS, AUD),
+            Err(VerifyError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn wrong_issuer_is_rejected() {
+        let idp = fake_idp();
+        let token = sign(
+            &idp,
+            json!({"iss": "https://evil.example.com", "aud": AUD, "sub": "s", "exp": now() + 60}),
+        );
+        assert!(matches!(
+            verify_with_jwks(&token, &idp.jwks, ISS, AUD),
+            Err(VerifyError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn expired_token_is_rejected() {
+        let idp = fake_idp();
+        let token = sign(&idp, json!({"iss": ISS, "aud": AUD, "sub": "s", "exp": now() - 3600}));
+        assert!(matches!(
+            verify_with_jwks(&token, &idp.jwks, ISS, AUD),
+            Err(VerifyError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn unknown_kid_is_reported() {
+        let idp = fake_idp();
+        let other = fake_idp(); // different key, but its JWKS still advertises KID
+        let token = sign(&other, valid_claims());
+        // Same kid, different key material -> signature fails, not an unknown kid.
+        assert!(matches!(
+            verify_with_jwks(&token, &idp.jwks, ISS, AUD),
+            Err(VerifyError::Invalid(_))
+        ));
+
+        // A token whose kid is absent from the JWKS is an unknown kid.
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("nonexistent".to_string());
+        let token = encode(&header, &valid_claims(), &idp.encoding).unwrap();
+        assert!(matches!(
+            verify_with_jwks(&token, &idp.jwks, ISS, AUD),
+            Err(VerifyError::UnknownKid(_))
+        ));
+    }
+}

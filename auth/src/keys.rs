@@ -1,0 +1,280 @@
+// Signing key management and Lore token minting.
+//
+// The auth service is the issuer of the "multiresource" tokens Lore verifies:
+// the client logs in to Dex, exchanges that identity here, and we hand back a
+// token signed with *our* key that carries the per-repository `resources` claim
+// Lore's storage/revision authorization (`verify_authorization`) requires.
+//
+// The private key is the source of truth, persisted (PKCS#8 PEM) in a shared
+// volume. The public JWKS is derived from it and rewritten on every startup so
+// loreserver, which reads it via `[server.auth.jwk].endpoint = file://`, always
+// sees a document matching the private key. `kid` is the RFC 7638 thumbprint, so
+// it changes if and only if the key does.
+use std::error::Error;
+use std::path::Path;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
+
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+use jsonwebtoken::encode;
+use jsonwebtoken::Algorithm;
+use jsonwebtoken::EncodingKey;
+use jsonwebtoken::Header;
+use rsa::pkcs8::DecodePrivateKey;
+use rsa::pkcs8::EncodePrivateKey;
+use rsa::pkcs8::LineEnding;
+use rsa::traits::PublicKeyParts;
+use rsa::RsaPrivateKey;
+use rsa::RsaPublicKey;
+use serde::Deserialize;
+use serde::Serialize;
+use sha2::Digest;
+use sha2::Sha256;
+
+type BoxError = Box<dyn Error + Send + Sync>;
+
+// Actions granted on each resource. Lore's `verify_authorization` matches on the
+// resource id alone and never inspects `permission`, but these are the actions
+// loreserver names (obliterate/presign), so a granted token reads correctly to
+// any consumer that does look.
+pub const ALL_ACTIONS: &[&str] = &["obliterate", "presign"];
+
+const KEY_FILE: &str = "signing_key.pem";
+const JWKS_FILE: &str = "jwks.json";
+const RSA_BITS: usize = 2048;
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+pub struct ResourceGrant {
+    pub resource_id: String,
+    pub permission: Vec<String>,
+}
+
+/// Claims of a minted Lore token. Mirrors the subset of Lore's
+/// `AuthorizationToken` that its verification reads: the registered claims plus
+/// the `resources` grant list.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct MintedClaims {
+    pub iss: String,
+    pub sub: String,
+    pub aud: Vec<String>,
+    pub iat: u64,
+    pub exp: u64,
+    pub resources: Vec<ResourceGrant>,
+}
+
+pub struct Signer {
+    encoding_key: EncodingKey,
+    pub kid: String,
+    pub jwks_json: String,
+}
+
+impl Signer {
+    /// Load the persisted signing key from `dir`, generating one on first run.
+    /// The derived JWKS is (re)written to `dir/jwks.json` either way so the file
+    /// loreserver reads always matches the private key in use.
+    pub fn load_or_generate(dir: &Path) -> Result<Signer, BoxError> {
+        std::fs::create_dir_all(dir)?;
+        let key_path = dir.join(KEY_FILE);
+
+        let pem = if key_path.exists() {
+            std::fs::read_to_string(&key_path)?
+        } else {
+            let mut rng = rand::thread_rng();
+            let private = RsaPrivateKey::new(&mut rng, RSA_BITS)?;
+            let pem = private.to_pkcs8_pem(LineEnding::LF)?.to_string();
+            std::fs::write(&key_path, pem.as_bytes())?;
+            pem
+        };
+
+        let signer = Signer::from_pkcs8_pem(&pem)?;
+        // Publish the derived JWKS for loreserver to read via file://. Rewritten
+        // every startup so it always matches the private key just loaded.
+        std::fs::write(dir.join(JWKS_FILE), signer.jwks_json.as_bytes())?;
+        Ok(signer)
+    }
+
+    /// Build a signer from a PKCS#8 PEM private key. Pure: derives the kid and
+    /// JWKS from the key, no I/O.
+    fn from_pkcs8_pem(pem: &str) -> Result<Signer, BoxError> {
+        let private = RsaPrivateKey::from_pkcs8_pem(pem)?;
+        let public = RsaPublicKey::from(&private);
+
+        let n = URL_SAFE_NO_PAD.encode(public.n().to_bytes_be());
+        let e = URL_SAFE_NO_PAD.encode(public.e().to_bytes_be());
+        let kid = thumbprint(&n, &e);
+        let jwks_json = build_jwks(&kid, &n, &e);
+
+        let encoding_key = EncodingKey::from_rsa_pem(pem.as_bytes())?;
+        Ok(Signer {
+            encoding_key,
+            kid,
+            jwks_json,
+        })
+    }
+
+    /// Mint a Lore token for `subject`, scoped to `resource_ids` (each already in
+    /// `urc-{repository}` form as the client requested), expiring at `exp`.
+    pub fn mint(
+        &self,
+        issuer: &str,
+        audience: &str,
+        subject: &str,
+        exp: u64,
+        resource_ids: &[String],
+    ) -> Result<String, BoxError> {
+        let claims = MintedClaims {
+            iss: issuer.to_string(),
+            sub: subject.to_string(),
+            aud: vec![audience.to_string()],
+            iat: now_secs(),
+            exp,
+            resources: resource_ids.iter().map(|id| grant(id.clone())).collect(),
+        };
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(self.kid.clone());
+        Ok(encode(&header, &claims, &self.encoding_key)?)
+    }
+}
+
+pub fn grant(resource_id: String) -> ResourceGrant {
+    ResourceGrant {
+        resource_id,
+        permission: ALL_ACTIONS.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn build_jwks(kid: &str, n: &str, e: &str) -> String {
+    serde_json::json!({
+        "keys": [{
+            "kty": "RSA",
+            "use": "sig",
+            "alg": "RS256",
+            "kid": kid,
+            "n": n,
+            "e": e,
+        }]
+    })
+    .to_string()
+}
+
+/// RFC 7638 JWK thumbprint for an RSA key: SHA-256 of the canonical member
+/// ordering (`e`, `kty`, `n`), base64url-encoded.
+fn thumbprint(n: &str, e: &str) -> String {
+    let canonical = format!(r#"{{"e":"{e}","kty":"RSA","n":"{n}"}}"#);
+    URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jsonwebtoken::decode;
+    use jsonwebtoken::jwk::JwkSet;
+    use jsonwebtoken::DecodingKey;
+    use jsonwebtoken::Validation;
+
+    const ISS: &str = "https://auth.lore.example.com";
+    const AUD: &str = "lore.example.com";
+
+    fn signer() -> Signer {
+        let dir = std::env::temp_dir().join(format!("kaguya-keys-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Signer::load_or_generate(&dir).expect("generate signer")
+    }
+
+    fn decoding_key(signer: &Signer) -> DecodingKey {
+        let set: JwkSet = serde_json::from_str(&signer.jwks_json).expect("parse jwks");
+        DecodingKey::from_jwk(&set.keys[0]).expect("decoding key from jwk")
+    }
+
+    fn validation() -> Validation {
+        let mut v = Validation::new(Algorithm::RS256);
+        v.set_audience(&[AUD]);
+        v.set_issuer(&[ISS]);
+        v.validate_exp = true;
+        v
+    }
+
+    // The end-to-end contract: a token we mint verifies against the JWKS we
+    // publish (the same JwkSet/from_jwk path loreserver uses) and carries the
+    // requested resource grants.
+    #[test]
+    fn minted_token_verifies_against_published_jwks() {
+        let signer = signer();
+        let resources = vec!["urc-abc".to_string(), "urc-def".to_string()];
+        let exp = now_secs() + 3600;
+
+        let token = signer.mint(ISS, AUD, "user-1", exp, &resources).unwrap();
+        let data = decode::<MintedClaims>(&token, &decoding_key(&signer), &validation())
+            .expect("minted token must verify against its own JWKS");
+
+        assert_eq!(data.claims.iss, ISS);
+        assert_eq!(data.claims.aud, vec![AUD.to_string()]);
+        assert_eq!(data.claims.sub, "user-1");
+        assert_eq!(data.claims.exp, exp);
+        let ids: Vec<&str> = data
+            .claims
+            .resources
+            .iter()
+            .map(|r| r.resource_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["urc-abc", "urc-def"]);
+        assert!(data
+            .claims
+            .resources
+            .iter()
+            .all(|r| r.permission == vec!["obliterate", "presign"]));
+    }
+
+    // Mirror of loreserver's `verify_authorization`: the resource the client will
+    // dial (`urc-{repository}`) must be present in the token's `resources`.
+    #[test]
+    fn minted_token_authorizes_the_requested_repository() {
+        let signer = signer();
+        let repo = "urc-0194b726b34e72b0b45550b88a967076".to_string();
+        let token = signer
+            .mint(ISS, AUD, "u", now_secs() + 60, std::slice::from_ref(&repo))
+            .unwrap();
+        let data = decode::<MintedClaims>(&token, &decoding_key(&signer), &validation()).unwrap();
+        assert!(data.claims.resources.iter().any(|r| r.resource_id == repo));
+    }
+
+    #[test]
+    fn wrong_audience_is_rejected() {
+        let signer = signer();
+        let token = signer
+            .mint(ISS, "someone-else", "u", now_secs() + 60, &["urc-x".into()])
+            .unwrap();
+        decode::<MintedClaims>(&token, &decoding_key(&signer), &validation())
+            .expect_err("a token minted for another audience must not verify");
+    }
+
+    #[test]
+    fn expired_token_is_rejected() {
+        let signer = signer();
+        let token = signer
+            .mint(ISS, AUD, "u", now_secs() - 3600, &["urc-x".into()])
+            .unwrap();
+        decode::<MintedClaims>(&token, &decoding_key(&signer), &validation())
+            .expect_err("an expired token must not verify");
+    }
+
+    // A persisted key round-trips to the same kid, so loreserver's cached key
+    // stays valid across auth-service restarts.
+    #[test]
+    fn kid_is_stable_across_reload() {
+        let dir = std::env::temp_dir().join(format!("kaguya-reload-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let first = Signer::load_or_generate(&dir).unwrap();
+        let second = Signer::load_or_generate(&dir).unwrap();
+        assert_eq!(first.kid, second.kid);
+        assert_eq!(first.jwks_json, second.jwks_json);
+    }
+}
