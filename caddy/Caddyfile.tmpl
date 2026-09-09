@@ -1,0 +1,6 @@
+# Rendered by setup.sh — edit the .tmpl, not the output.
+{{LORE_HOST}} {
+    # Fronts Lore's HTTP health endpoint and drives ACME issuance for
+    # LORE_HOST. Lore's real traffic is QUIC (UDP 41337) and bypasses Caddy.
+    reverse_proxy lore:41339
+}

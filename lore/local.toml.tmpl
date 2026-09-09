@@ -1,0 +1,40 @@
+# Rendered by setup.sh — edit the .tmpl, not the output.
+# Layered over the loreserver image's baked-in default.toml + docker.toml
+# (LORE_CONFIG_PATH=/etc/lore/config, so this file loads last as local.toml).
+
+# JWT verification. Its presence enables auth; jwt_issuer and jwt_audience are
+# mandatory (the server refuses to start without them). Dex is the issuer and
+# LORE_HOST is the audience — the three-way identity: host = client_id = aud.
+[server.auth]
+jwt_issuer = "https://{{DEX_HOST}}/dex"
+jwt_audience = ["{{LORE_HOST}}"]
+# Enable once a Dex connector emits group memberships (staticPasswords do not):
+# permission_claim = "groups"
+
+# Public QUIC TLS cert, issued by Caddy for LORE_HOST and read from the shared
+# caddy-data volume. Path follows Caddy's ACME (Let's Encrypt) layout; if you
+# change ACME CA the directory name changes with it.
+[server.quic.certificate]
+cert_file = "/caddy-certs/caddy/certificates/acme-v02.api.letsencrypt.org-directory/{{LORE_HOST}}/{{LORE_HOST}}.crt"
+pkey_file = "/caddy-certs/caddy/certificates/acme-v02.api.letsencrypt.org-directory/{{LORE_HOST}}/{{LORE_HOST}}.key"
+
+# environment_service advertises these endpoints to the lore CLI. auth_url's
+# scheme selects the client auth handler (https -> OIDC/UCS); the rest point at
+# this server over lore:// (QUIC/gRPC on 41337).
+[server.grpc_public_services.environment_service]
+enabled = true
+
+[environment.endpoint]
+auth_url = "https://{{DEX_HOST}}/dex"
+repository_url = "lore://{{LORE_HOST}}:41337"
+storage_url = "lore://{{LORE_HOST}}:41337"
+revision_url = "lore://{{LORE_HOST}}:41337"
+lock_url = "lore://{{LORE_HOST}}:41337"
+notification_url = "lore://{{LORE_HOST}}:41337"
+
+# Persist both stores on the lore-data volume (default leaves path unset, which
+# would use a temp dir cleared on restart).
+[immutable_store.local]
+path = "/data"
+[mutable_store.local]
+path = "/data"

@@ -1,0 +1,4 @@
+.env
+# rendered from *.tmpl by setup.sh
+caddy/Caddyfile
+lore/local.toml

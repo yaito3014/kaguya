@@ -1,0 +1,38 @@
+# kaguya: Lore version-control server + Caddy (TLS edge), on its own VPS.
+# Uses the shared Dex IdP on iroha (https://dex.<domain>/dex) as its issuer.
+# Run ./setup.sh (after copying .env.example to .env) to render configs.
+#
+# No public loreserver image exists yet, so the image is built from
+# EpicGames/lore and loaded here (see README). QUIC is UDP and cannot pass
+# through Caddy; it is published directly. Caddy issues the QUIC TLS cert
+# (lore.<domain> site) and Lore reads it from the shared caddy-data volume.
+
+services:
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"      # ACME HTTP-01 + redirect
+      - "443:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro   # rendered by setup.sh
+      - caddy-data:/data        # certificates live here — do not delete
+      - caddy-config:/config
+
+  lore:
+    image: loreserver:v0.9.0    # built from EpicGames/lore and loaded here; see README
+    restart: unless-stopped
+    depends_on:
+      - caddy
+    ports:
+      - "41337:41337/udp"   # QUIC: clone / push
+      - "41337:41337/tcp"   # gRPC
+    volumes:
+      - ./lore/local.toml:/etc/lore/config/local.toml:ro   # rendered by setup.sh
+      - lore-data:/data                                    # immutable + mutable stores
+      - caddy-data:/caddy-certs:ro                         # QUIC TLS cert issued by Caddy
+
+volumes:
+  caddy-data:
+  caddy-config:
+  lore-data:
