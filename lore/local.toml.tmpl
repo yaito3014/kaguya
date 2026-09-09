@@ -3,13 +3,25 @@
 # (LORE_CONFIG_PATH=/etc/lore/config, so this file loads last as local.toml).
 
 # JWT verification. Its presence enables auth; jwt_issuer and jwt_audience are
-# mandatory (the server refuses to start without them). Dex is the issuer and
-# LORE_HOST is the audience — the three-way identity: host = client_id = aud.
+# mandatory (the server refuses to start without them).
+#
+# The issuer here is the kaguya-auth service, NOT Dex: loreserver only ever sees
+# the *exchanged* (multiresource) token, which kaguya-auth mints and signs after
+# verifying the caller's Dex identity. That minted token carries the `resources`
+# claim loreserver's storage/revision authorization requires (a raw Dex token has
+# none, which is why clone/push could not authorize before). jwt_audience stays
+# LORE_HOST — the three-way identity host = client_id = aud is unchanged; only who
+# signs the token loreserver checks has moved from Dex to the auth service.
 [server.auth]
-jwt_issuer = "https://{{DEX_HOST}}/dex"
+jwt_issuer = "https://{{LORE_AUTH_HOST}}"
 jwt_audience = ["{{LORE_HOST}}"]
-# Enable once a Dex connector emits group memberships (staticPasswords do not):
-# permission_claim = "groups"
+
+# Verify minted tokens against the JWKS kaguya-auth publishes to the shared
+# auth-keys volume. An explicit endpoint skips OIDC discovery; the file:// scheme
+# is read directly, so no HTTP/TLS is involved. The auth service (re)writes this
+# file from its private key on startup, so it always matches what it signs with.
+[server.auth.jwk]
+endpoint = "file:///keys/jwks.json"
 
 # Public QUIC TLS cert, issued by Caddy for LORE_HOST and read from the shared
 # caddy-data volume. Path follows Caddy's ACME (Let's Encrypt) layout; if you
@@ -25,11 +37,12 @@ pkey_file = "/caddy-certs/caddy/certificates/acme-v02.api.letsencrypt.org-direct
 enabled = true
 
 [environment.endpoint]
-# auth_url points at the internal kaguya-auth ReBAC service (all-allow). This
-# makes repository_authorizer build an AuthClientAuthorizer that calls our
-# service for create_resource / check_user_permission, so clients send their
-# token (authentication works) and the service grants every action.
-# Authentication itself is still enforced by [server.auth] above.
+# auth_url points at the kaguya-auth service (public, via Caddy). Both sides use
+# it: the client calls exchange_user_token_for_multiresource_token here to turn
+# its Dex identity into the repository-scoped token loreserver accepts, and the
+# server builds an AuthClientAuthorizer that calls create_resource /
+# check_user_permission here (all-allow). Authentication is enforced by
+# [server.auth] above; scope now rides in the exchanged token's `resources`.
 auth_url = "https://{{LORE_AUTH_HOST}}"
 repository_url = "lore://{{LORE_HOST}}:41337"
 storage_url = "lore://{{LORE_HOST}}:41337"

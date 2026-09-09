@@ -5,7 +5,8 @@
 # No public loreserver image exists yet, so it is built from EpicGames/lore and
 # loaded here (see README). QUIC is UDP and cannot pass through Caddy; it is
 # published directly. Caddy issues the QUIC TLS cert (lore.<domain> site) and
-# Lore reads it from the shared caddy-data volume. The auth service provides the
+# Lore reads it from the shared caddy-data volume. The auth service verifies Dex
+# identities and mints the repository-scoped tokens Lore accepts, and serves the
 # ReBAC gRPC API Lore expects (all-allow); it is internal only.
 
 services:
@@ -21,18 +22,39 @@ services:
       - caddy-config:/config
 
   auth:
-    image: kaguya-auth:0.1.0    # built from ./auth (see README)
+    image: kaguya-auth:0.2.0    # built from ./auth (see README)
     restart: unless-stopped
-    # All-allow ReBAC authorizer. Authentication is still enforced by
-    # loreserver's [server.auth]; this grants every action, so it must NOT be
-    # published — no ports, internal compose network only.
+    # Verifies the caller's Dex token and mints a repository-scoped Lore token
+    # signed with its own key; also serves the all-allow ReBAC API. It never
+    # needs to be published (clients reach token exchange via Caddy on
+    # LORE_AUTH_HOST), so it stays on the internal compose network only.
+    environment:
+      # Issuer to verify incoming Dex identity tokens against, and their audience.
+      KAGUYA_DEX_ISSUER: "https://${DEX_HOST}/dex"
+      KAGUYA_JWT_AUDIENCE: "${LORE_HOST}"
+      # Issuer stamped on minted tokens; must equal loreserver's jwt_issuer.
+      KAGUYA_AUTH_ISSUER: "https://${LORE_AUTH_HOST}"
+      KAGUYA_KEYS_DIR: "/keys"
+    volumes:
+      - auth-keys:/keys        # private signing key + published JWKS (see lore)
+    # loreserver eagerly fetches the JWKS at startup and refuses to boot if it is
+    # absent. This gate holds lore back until the auth service has written it, so
+    # a fresh `up` does not crash-loop lore while the key is being generated.
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /keys/jwks.json"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 5s
 
   lore:
     image: loreserver:v0.9.0    # built from EpicGames/lore and loaded here; see README
     restart: unless-stopped
     depends_on:
-      - caddy
-      - auth
+      caddy:
+        condition: service_started
+      auth:
+        condition: service_healthy   # JWKS present before lore's startup fetch
     ports:
       - "41337:41337/udp"   # QUIC: clone / push
       - "41337:41337/tcp"   # gRPC
@@ -40,8 +62,10 @@ services:
       - ./lore/local.toml:/etc/lore/config/local.toml:ro   # rendered by setup.sh
       - lore-data:/data                                    # immutable + mutable stores
       - caddy-data:/caddy-certs:ro                         # QUIC TLS cert issued by Caddy
+      - auth-keys:/keys:ro     # JWKS for verifying exchanged tokens (file:// in local.toml)
 
 volumes:
   caddy-data:
   caddy-config:
   lore-data:
+  auth-keys:
