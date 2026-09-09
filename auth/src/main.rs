@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use tonic::{transport::Server, Request, Response, Status};
 
+mod jwks;
 mod keys;
 mod verify;
 
@@ -251,6 +252,20 @@ async fn main() -> Result<(), BoxError> {
     let keys_dir = PathBuf::from(std::env::var("KAGUYA_KEYS_DIR").unwrap_or_else(|_| "/keys".into()));
 
     let signer = Arc::new(Signer::load_or_generate(&keys_dir)?);
+
+    // Publish the combined JWKS (our signing key + Dex's keys) before serving, so
+    // loreserver's eager startup fetch and the container healthcheck find it. A
+    // background refresh tracks Dex key rotation and recovers if Dex was down.
+    let http = reqwest::Client::new();
+    jwks::publish(&keys_dir, &http, &dex_issuer, signer.own_jwk()).await?;
+    jwks::spawn_refresh(
+        keys_dir.clone(),
+        http,
+        dex_issuer.clone(),
+        signer.own_jwk().clone(),
+        std::time::Duration::from_secs(300),
+    );
+
     let dex = Arc::new(DexVerifier::new(dex_issuer.clone(), audience.clone()));
 
     let auth = Auth {

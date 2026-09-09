@@ -6,10 +6,9 @@
 // Lore's storage/revision authorization (`verify_authorization`) requires.
 //
 // The private key is the source of truth, persisted (PKCS#8 PEM) in a shared
-// volume. The public JWKS is derived from it and rewritten on every startup so
-// loreserver, which reads it via `[server.auth.jwk].endpoint = file://`, always
-// sees a document matching the private key. `kid` is the RFC 7638 thumbprint, so
-// it changes if and only if the key does.
+// volume. Our public key is published as one JWK (`own_jwk`); the combined JWKS
+// loreserver reads (this key plus Dex's, see `jwks`) is assembled elsewhere.
+// `kid` is the RFC 7638 thumbprint, so it changes if and only if the key does.
 use std::error::Error;
 use std::path::Path;
 use std::time::SystemTime;
@@ -29,6 +28,7 @@ use rsa::RsaPrivateKey;
 use rsa::RsaPublicKey;
 use serde::Deserialize;
 use serde::Serialize;
+use serde_json::Value;
 use sha2::Digest;
 use sha2::Sha256;
 
@@ -41,7 +41,6 @@ type BoxError = Box<dyn Error + Send + Sync>;
 pub const ALL_ACTIONS: &[&str] = &["obliterate", "presign"];
 
 const KEY_FILE: &str = "signing_key.pem";
-const JWKS_FILE: &str = "jwks.json";
 const RSA_BITS: usize = 2048;
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -66,13 +65,13 @@ pub struct MintedClaims {
 pub struct Signer {
     encoding_key: EncodingKey,
     pub kid: String,
-    pub jwks_json: String,
+    own_jwk: Value,
 }
 
 impl Signer {
     /// Load the persisted signing key from `dir`, generating one on first run.
-    /// The derived JWKS is (re)written to `dir/jwks.json` either way so the file
-    /// loreserver reads always matches the private key in use.
+    /// Only the private key is written here; the published JWKS is assembled by
+    /// the caller (it also carries Dex's keys).
     pub fn load_or_generate(dir: &Path) -> Result<Signer, BoxError> {
         std::fs::create_dir_all(dir)?;
         let key_path = dir.join(KEY_FILE);
@@ -87,15 +86,11 @@ impl Signer {
             pem
         };
 
-        let signer = Signer::from_pkcs8_pem(&pem)?;
-        // Publish the derived JWKS for loreserver to read via file://. Rewritten
-        // every startup so it always matches the private key just loaded.
-        std::fs::write(dir.join(JWKS_FILE), signer.jwks_json.as_bytes())?;
-        Ok(signer)
+        Signer::from_pkcs8_pem(&pem)
     }
 
     /// Build a signer from a PKCS#8 PEM private key. Pure: derives the kid and
-    /// JWKS from the key, no I/O.
+    /// public JWK from the key, no I/O.
     fn from_pkcs8_pem(pem: &str) -> Result<Signer, BoxError> {
         let private = RsaPrivateKey::from_pkcs8_pem(pem)?;
         let public = RsaPublicKey::from(&private);
@@ -103,14 +98,20 @@ impl Signer {
         let n = URL_SAFE_NO_PAD.encode(public.n().to_bytes_be());
         let e = URL_SAFE_NO_PAD.encode(public.e().to_bytes_be());
         let kid = thumbprint(&n, &e);
-        let jwks_json = build_jwks(&kid, &n, &e);
+        let own_jwk = build_jwk(&kid, &n, &e);
 
         let encoding_key = EncodingKey::from_rsa_pem(pem.as_bytes())?;
         Ok(Signer {
             encoding_key,
             kid,
-            jwks_json,
+            own_jwk,
         })
+    }
+
+    /// Our public signing key as a single JWK, for embedding in the combined
+    /// JWKS loreserver reads.
+    pub fn own_jwk(&self) -> &Value {
+        &self.own_jwk
     }
 
     /// Mint a Lore token for `subject`, scoped to `resource_ids` (each already in
@@ -151,18 +152,15 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn build_jwks(kid: &str, n: &str, e: &str) -> String {
+fn build_jwk(kid: &str, n: &str, e: &str) -> Value {
     serde_json::json!({
-        "keys": [{
-            "kty": "RSA",
-            "use": "sig",
-            "alg": "RS256",
-            "kid": kid,
-            "n": n,
-            "e": e,
-        }]
+        "kty": "RSA",
+        "use": "sig",
+        "alg": "RS256",
+        "kid": kid,
+        "n": n,
+        "e": e,
     })
-    .to_string()
 }
 
 /// RFC 7638 JWK thumbprint for an RSA key: SHA-256 of the canonical member
@@ -176,7 +174,7 @@ fn thumbprint(n: &str, e: &str) -> String {
 mod tests {
     use super::*;
     use jsonwebtoken::decode;
-    use jsonwebtoken::jwk::JwkSet;
+    use jsonwebtoken::jwk::Jwk;
     use jsonwebtoken::DecodingKey;
     use jsonwebtoken::Validation;
 
@@ -190,8 +188,8 @@ mod tests {
     }
 
     fn decoding_key(signer: &Signer) -> DecodingKey {
-        let set: JwkSet = serde_json::from_str(&signer.jwks_json).expect("parse jwks");
-        DecodingKey::from_jwk(&set.keys[0]).expect("decoding key from jwk")
+        let jwk: Jwk = serde_json::from_value(signer.own_jwk().clone()).expect("own jwk parses");
+        DecodingKey::from_jwk(&jwk).expect("decoding key from jwk")
     }
 
     fn validation() -> Validation {
@@ -202,18 +200,18 @@ mod tests {
         v
     }
 
-    // The end-to-end contract: a token we mint verifies against the JWKS we
-    // publish (the same JwkSet/from_jwk path loreserver uses) and carries the
+    // The end-to-end contract: a token we mint verifies against the JWK we
+    // publish (the same Jwk/from_jwk path loreserver uses) and carries the
     // requested resource grants.
     #[test]
-    fn minted_token_verifies_against_published_jwks() {
+    fn minted_token_verifies_against_published_jwk() {
         let signer = signer();
         let resources = vec!["urc-abc".to_string(), "urc-def".to_string()];
         let exp = now_secs() + 3600;
 
         let token = signer.mint(ISS, AUD, "user-1", exp, &resources).unwrap();
         let data = decode::<MintedClaims>(&token, &decoding_key(&signer), &validation())
-            .expect("minted token must verify against its own JWKS");
+            .expect("minted token must verify against its own JWK");
 
         assert_eq!(data.claims.iss, ISS);
         assert_eq!(data.claims.aud, vec![AUD.to_string()]);
@@ -266,8 +264,8 @@ mod tests {
             .expect_err("an expired token must not verify");
     }
 
-    // A persisted key round-trips to the same kid, so loreserver's cached key
-    // stays valid across auth-service restarts.
+    // A persisted key round-trips to the same kid and JWK, so loreserver's cached
+    // key stays valid across auth-service restarts.
     #[test]
     fn kid_is_stable_across_reload() {
         let dir = std::env::temp_dir().join(format!("kaguya-reload-{}", std::process::id()));
@@ -275,6 +273,6 @@ mod tests {
         let first = Signer::load_or_generate(&dir).unwrap();
         let second = Signer::load_or_generate(&dir).unwrap();
         assert_eq!(first.kid, second.kid);
-        assert_eq!(first.jwks_json, second.jwks_json);
+        assert_eq!(first.own_jwk(), second.own_jwk());
     }
 }

@@ -5,21 +5,24 @@
 # JWT verification. Its presence enables auth; jwt_issuer and jwt_audience are
 # mandatory (the server refuses to start without them).
 #
-# The issuer here is the kaguya-auth service, NOT Dex: loreserver only ever sees
-# the *exchanged* (multiresource) token, which kaguya-auth mints and signs after
-# verifying the caller's Dex identity. That minted token carries the `resources`
-# claim loreserver's storage/revision authorization requires (a raw Dex token has
-# none, which is why clone/push could not authorize before). jwt_audience stays
-# LORE_HOST — the three-way identity host = client_id = aud is unchanged; only who
-# signs the token loreserver checks has moved from Dex to the auth service.
+# TWO issuers, because loreserver sees two kinds of token with one verifier:
+#   - Dex-signed identity tokens on the authn-only repository service. The client
+#     sends these before it knows the repository id, so it cannot yet exchange
+#     (the exchange is per-repository) and hands over the raw Dex token.
+#   - kaguya-auth-signed exchanged tokens on storage/revision. kaguya-auth mints
+#     these after verifying the Dex identity, adding the `resources` claim that
+#     storage/revision authorization requires (a raw Dex token has none, which is
+#     why clone/push could not authorize before).
+# jwt_audience stays LORE_HOST for both (host = client_id = aud is unchanged).
 [server.auth]
-jwt_issuer = "https://{{LORE_AUTH_HOST}}"
+jwt_issuer = ["https://{{DEX_HOST}}/dex", "https://{{LORE_AUTH_HOST}}"]
 jwt_audience = ["{{LORE_HOST}}"]
 
-# Verify minted tokens against the JWKS kaguya-auth publishes to the shared
-# auth-keys volume. An explicit endpoint skips OIDC discovery; the file:// scheme
-# is read directly, so no HTTP/TLS is involved. The auth service (re)writes this
-# file from its private key on startup, so it always matches what it signs with.
+# One JWKS carries both signers' keys: kaguya-auth publishes its own signing key
+# plus Dex's (fetched from Dex) to the shared auth-keys volume, refreshing to
+# track Dex key rotation. An explicit endpoint skips OIDC discovery (which
+# resolves only one issuer anyway); the file:// scheme is read directly, so no
+# HTTP/TLS is involved.
 [server.auth.jwk]
 endpoint = "file:///keys/jwks.json"
 

@@ -58,11 +58,6 @@ impl fmt::Display for VerifyError {
 
 impl Error for VerifyError {}
 
-#[derive(Deserialize)]
-struct DiscoveryDoc {
-    jwks_uri: String,
-}
-
 pub struct DexVerifier {
     issuer: String,
     audience: String,
@@ -101,27 +96,10 @@ impl DexVerifier {
     }
 
     async fn fetch_jwks(&self) -> Result<JwkSet, VerifyError> {
-        let discovery_url = format!("{}/.well-known/openid-configuration", self.issuer);
-        let discovery: DiscoveryDoc = self
-            .client
-            .get(&discovery_url)
-            .send()
+        let value = crate::jwks::fetch_jwks(&self.client, &self.issuer)
             .await
-            .and_then(|r| r.error_for_status())
-            .map_err(|e| VerifyError::Jwks(format!("discovery {discovery_url}: {e}")))?
-            .json()
-            .await
-            .map_err(|e| VerifyError::Jwks(format!("discovery parse: {e}")))?;
-
-        self.client
-            .get(&discovery.jwks_uri)
-            .send()
-            .await
-            .and_then(|r| r.error_for_status())
-            .map_err(|e| VerifyError::Jwks(format!("jwks {}: {e}", discovery.jwks_uri)))?
-            .json()
-            .await
-            .map_err(|e| VerifyError::Jwks(format!("jwks parse: {e}")))
+            .map_err(VerifyError::Jwks)?;
+        serde_json::from_value(value).map_err(|e| VerifyError::Jwks(format!("jwks parse: {e}")))
     }
 }
 
