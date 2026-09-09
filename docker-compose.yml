@@ -1,11 +1,12 @@
-# kaguya: Lore version-control server + Caddy (TLS edge), on its own VPS.
+# kaguya: Lore version-control server + Caddy (TLS edge) + auth (ReBAC), on its own VPS.
 # Uses the shared Dex IdP on iroha (https://dex.<domain>/dex) as its issuer.
 # Run ./setup.sh (after copying .env.example to .env) to render configs.
 #
-# No public loreserver image exists yet, so the image is built from
-# EpicGames/lore and loaded here (see README). QUIC is UDP and cannot pass
-# through Caddy; it is published directly. Caddy issues the QUIC TLS cert
-# (lore.<domain> site) and Lore reads it from the shared caddy-data volume.
+# No public loreserver image exists yet, so it is built from EpicGames/lore and
+# loaded here (see README). QUIC is UDP and cannot pass through Caddy; it is
+# published directly. Caddy issues the QUIC TLS cert (lore.<domain> site) and
+# Lore reads it from the shared caddy-data volume. The auth service provides the
+# ReBAC gRPC API Lore expects (all-allow); it is internal only.
 
 services:
   caddy:
@@ -19,11 +20,19 @@ services:
       - caddy-data:/data        # certificates live here — do not delete
       - caddy-config:/config
 
+  auth:
+    image: kaguya-auth:0.1.0    # built from ./auth (see README)
+    restart: unless-stopped
+    # All-allow ReBAC authorizer. Authentication is still enforced by
+    # loreserver's [server.auth]; this grants every action, so it must NOT be
+    # published — no ports, internal compose network only.
+
   lore:
     image: loreserver:v0.9.0    # built from EpicGames/lore and loaded here; see README
     restart: unless-stopped
     depends_on:
       - caddy
+      - auth
     ports:
       - "41337:41337/udp"   # QUIC: clone / push
       - "41337:41337/tcp"   # gRPC
