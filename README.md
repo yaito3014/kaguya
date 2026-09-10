@@ -66,11 +66,10 @@ This opens a Dex login page; approve it and the CLI stores the session.
 this flow, so when the token expires you log in again (there is nothing to renew
 in the background). Tokens are issued with the Dex token's expiry.
 
-The non-interactive helper `examples/get-token.sh` still works as an alternative
-(e.g. for scripts), handing the CLI a Dex token directly:
-
-    TOKEN=$(./examples/get-token.sh)
-    lore auth login --token-type lore --token "$TOKEN" lore://lore.yai.to:41337
+loreserver trusts only `kaguya-auth` as issuer, so the old `get-token.sh` /
+`--token-type lore` path (which hands the CLI a raw Dex token) no longer works:
+loreserver rejects the Dex-signed identity token. Use `lore auth login`.
+`examples/get-token.sh` is kept only as a reference for the Dex device flow.
 
 ## Authorization (ReBAC)
 

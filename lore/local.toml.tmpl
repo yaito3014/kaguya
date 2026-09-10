@@ -5,24 +5,20 @@
 # JWT verification. Its presence enables auth; jwt_issuer and jwt_audience are
 # mandatory (the server refuses to start without them).
 #
-# TWO issuers, because loreserver sees two kinds of token with one verifier:
-#   - Dex-signed identity tokens on the authn-only repository service. The client
-#     sends these before it knows the repository id, so it cannot yet exchange
-#     (the exchange is per-repository) and hands over the raw Dex token.
-#   - kaguya-auth-signed exchanged tokens on storage/revision. kaguya-auth mints
-#     these after verifying the Dex identity, adding the `resources` claim that
-#     storage/revision authorization requires (a raw Dex token has none, which is
-#     why clone/push could not authorize before).
-# jwt_audience stays LORE_HOST for both (host = client_id = aud is unchanged).
+# ONE issuer: kaguya-auth. With native login the client's identity token is
+# minted by kaguya-auth too, so every token loreserver sees is signed by it —
+# the identity token on the authn-only repository service, and the exchanged
+# (resources-bearing) token on storage/revision. Dex is only the identity backend
+# kaguya-auth federates to at login; Dex tokens never reach loreserver. Note this
+# means the get-token.sh path (which stores a raw Dex token as the identity) no
+# longer works; use `lore auth login`. jwt_audience is LORE_HOST.
 [server.auth]
-jwt_issuer = ["https://{{DEX_HOST}}/dex", "https://{{LORE_AUTH_HOST}}"]
+jwt_issuer = "https://{{LORE_AUTH_HOST}}"
 jwt_audience = ["{{LORE_HOST}}"]
 
-# One JWKS carries both signers' keys: kaguya-auth publishes its own signing key
-# plus Dex's (fetched from Dex) to the shared auth-keys volume, refreshing to
-# track Dex key rotation. An explicit endpoint skips OIDC discovery (which
-# resolves only one issuer anyway); the file:// scheme is read directly, so no
-# HTTP/TLS is involved.
+# kaguya-auth publishes its signing key here (that key alone) for loreserver to
+# read. An explicit endpoint skips OIDC discovery; the file:// scheme is read
+# directly, so no HTTP/TLS is involved.
 [server.auth.jwk]
 endpoint = "file:///keys/jwks.json"
 
