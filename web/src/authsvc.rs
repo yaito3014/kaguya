@@ -1,4 +1,4 @@
-//! gRPC client to kaguya-auth (internal). Turns the user's Dex identity into a
+//! gRPC client to kaguya-auth (internal). Turns the user's OIDC identity into a
 //! Lore token, and (later) mints per-repository authorization tokens.
 use tonic::transport::Channel;
 use tonic::Request;
@@ -31,13 +31,13 @@ impl AuthClient {
             .map_err(|e| format!("auth connect: {e}"))
     }
 
-    /// Exchange a Dex identity token for our own signed UCS authn token (the
+    /// Exchange an OIDC identity token for our own signed UCS authn token (the
     /// user's Lore identity for the rest of the session).
-    pub async fn exchange_external(&self, dex_token: &str) -> Result<Issued, String> {
+    pub async fn exchange_external(&self, id_token: &str) -> Result<Issued, String> {
         let mut client = self.connect().await?;
         let resp = client
             .exchange_external_token_for_user_token(ExchangeExternalTokenForUserTokenRequest {
-                external_token: dex_token.to_string(),
+                external_token: id_token.to_string(),
                 token_type: "external".to_string(),
             })
             .await

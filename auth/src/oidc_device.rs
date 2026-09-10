@@ -1,7 +1,8 @@
-// Dex OAuth 2.0 device-flow client (RFC 8628), wrapped so our UCS can offer
-// native `lore auth login`. StartAuthSession calls `start` to begin the flow and
-// hand the user Dex's verification URL; GetAuthSession calls `poll` on each tick
-// until Dex returns a token (the user approved) or a terminal error.
+// OAuth 2.0 device-flow client (RFC 8628) for the OIDC provider, wrapped so our
+// UCS can offer native `lore auth login`. StartAuthSession calls `start` to begin
+// the flow and hand the user the provider's verification URL; GetAuthSession
+// calls `poll` on each tick until the provider returns a token (the user
+// approved) or a terminal error.
 use serde::Deserialize;
 
 const SCOPE: &str = "openid profile email";
@@ -41,21 +42,21 @@ pub struct DeviceStart {
 pub enum Poll {
     /// The user has not finished authorizing; keep polling.
     Pending,
-    /// The user approved; the Dex access token.
+    /// The user approved; the provider's access token.
     Token(String),
     /// A terminal failure (expired, denied, …); stop polling.
     Denied(String),
 }
 
-pub struct DexLogin {
+pub struct OidcDeviceLogin {
     client: reqwest::Client,
     issuer: String,
     client_id: String,
 }
 
-impl DexLogin {
+impl OidcDeviceLogin {
     pub fn new(client: reqwest::Client, issuer: String, client_id: String) -> Self {
-        DexLogin {
+        OidcDeviceLogin {
             client,
             issuer,
             client_id,

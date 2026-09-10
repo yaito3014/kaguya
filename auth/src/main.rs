@@ -1,7 +1,7 @@
-// kaguya-auth: auth/ReBAC service for a Dex-fronted Lore server.
+// kaguya-auth: auth/ReBAC service for a Lore server fronted by an OIDC provider.
 //
 // Lore expects a UCS-style auth service for two things this fills:
-//   - token exchange: the client presents its Dex identity token here and
+//   - token exchange: the client presents its OIDC identity token here and
 //     receives a repository-scoped "multiresource" token loreserver accepts, and
 //   - the ReBAC gRPC API loreserver calls to create/authorize resources
 //     (RebacApi + UrcAuthApi.CheckUserPermission / LookupUserPermissions).
@@ -13,8 +13,8 @@
 // what loreserver's storage/revision authorization reads. Grants and groups are
 // managed with the binary's admin subcommands (see `run_admin`).
 //
-// Identity still comes from Dex: the exchange verifies the caller's Dex token
-// (see `verify`) before minting, and the minted token is signed with our own key
+// Identity still comes from the OIDC provider: the exchange verifies the caller's
+// id token (see `verify`) before minting, and the minted token is signed with our own key
 // (see `keys`), which loreserver trusts via `[server.auth]` + the published JWKS.
 use std::error::Error;
 use std::path::PathBuf;
@@ -22,18 +22,18 @@ use std::sync::Arc;
 
 use tonic::{transport::Server, Request, Response, Status};
 
-mod dexlogin;
 mod jwks;
 mod keys;
+mod oidc_device;
 mod sessions;
 mod store;
 mod verify;
 
-use dexlogin::{DexLogin, Poll};
 use keys::{ResourceGrant, Signer};
+use oidc_device::{OidcDeviceLogin, Poll};
 use sessions::Sessions;
 use store::{Role, Store};
-use verify::{DexVerifier, Identity, IdentityClaims, SelfVerifier};
+use verify::{Identity, IdentityClaims, OidcVerifier, SelfVerifier};
 
 pub mod ucs_auth {
     include!(concat!(env!("OUT_DIR"), "/ucs.auth.rs"));
@@ -117,10 +117,10 @@ impl RebacApi for Rebac {
 
 struct Auth {
     signer: Arc<Signer>,
-    dex: Arc<DexVerifier>,
+    oidc: Arc<OidcVerifier>,
     store: Arc<Store>,
     identity: Arc<Identity>,
-    dexlogin: Arc<DexLogin>,
+    oidc_device: Arc<OidcDeviceLogin>,
     sessions: Arc<Sessions>,
     /// `iss` stamped on minted tokens; must equal loreserver's `jwt_issuer`.
     auth_issuer: String,
@@ -221,14 +221,15 @@ impl UrcAuthApi for Auth {
         Ok(Response::new(GetUserInfoResponse { user_info: vec![] }))
     }
 
-    /// Begin native interactive login: start a Dex device authorization and hand
-    /// the client Dex's verification URL plus a session_code to poll with.
+    /// Begin native interactive login: start a device authorization with the OIDC
+    /// provider and hand the client the provider's verification URL plus a
+    /// session_code to poll with.
     async fn start_auth_session(
         &self,
         req: Request<StartAuthSessionRequest>,
     ) -> Result<Response<StartAuthSessionResponse>, Status> {
         let client_state = req.into_inner().client_state;
-        let start = self.dexlogin.start().await.map_err(|e| {
+        let start = self.oidc_device.start().await.map_err(|e| {
             eprintln!("start_auth_session: {e}");
             Status::internal("could not start login")
         })?;
@@ -248,7 +249,7 @@ impl UrcAuthApi for Auth {
     }
 
     /// Poll a login session: return no token while the user is still authorizing,
-    /// or, once Dex issues a token, mint and return our own authn token (which the
+    /// or, once the provider issues a token, mint and return our own authn token (which the
     /// client stores as its identity and re-presents to the exchange).
     async fn get_auth_session(
         &self,
@@ -260,11 +261,11 @@ impl UrcAuthApi for Auth {
             .resolve(&r.session_code, &r.client_state)
             .ok_or_else(|| Status::not_found("unknown or expired login session"))?;
 
-        match self.dexlogin.poll(&token_endpoint, &device_code).await {
+        match self.oidc_device.poll(&token_endpoint, &device_code).await {
             Ok(Poll::Pending) => Ok(Response::new(GetAuthSessionResponse { user_token: None })),
-            Ok(Poll::Token(dex_token)) => {
-                let claims = self.dex.verify(&dex_token).await.map_err(|e| {
-                    eprintln!("get_auth_session: dex token rejected: {e}");
+            Ok(Poll::Token(id_token)) => {
+                let claims = self.oidc.verify(&id_token).await.map_err(|e| {
+                    eprintln!("get_auth_session: id token rejected: {e}");
                     Status::internal("login token invalid")
                 })?;
                 self.sessions.remove(&r.session_code);
@@ -318,7 +319,7 @@ impl UrcAuthApi for Auth {
     ) -> Result<Response<VerifyUserResponse>, Status> {
         Err(Status::unimplemented("verify_user"))
     }
-    /// Exchange an external IdP token (a Dex token from the web frontend's OIDC
+    /// Exchange an external IdP token (an id token from the web frontend's OIDC
     /// login) for our own signed authn token. The web BFF calls this once after
     /// login, then uses the returned token as the user's Lore identity — same as
     /// the token native login mints, just obtained via the auth-code flow.
@@ -330,7 +331,7 @@ impl UrcAuthApi for Auth {
         if external.is_empty() {
             return Err(Status::unauthenticated("missing external token"));
         }
-        let claims = self.dex.verify(&external).await.map_err(|e| {
+        let claims = self.oidc.verify(&external).await.map_err(|e| {
             eprintln!("exchange_external: rejecting external token: {e}");
             Status::unauthenticated("invalid external token")
         })?;
@@ -367,7 +368,7 @@ impl UrcAuthApi for Auth {
         Err(Status::unimplemented("exchange_api_key_for_user_token"))
     }
 
-    /// Verify the caller's Dex token, then mint a Lore token scoped to the
+    /// Verify the caller's id token, then mint a Lore token scoped to the
     /// repositories the caller is actually allowed. Requested resources the
     /// caller has no grant on are dropped, so loreserver's storage/revision
     /// authorization (which reads the `resources` claim) denies them.
@@ -381,7 +382,7 @@ impl UrcAuthApi for Auth {
         }
 
         // The bearer is the caller's identity token: our own authn token (native
-        // login) or a Dex token (get-token.sh). Either is accepted and verified.
+        // login) or an OIDC token (get-token.sh). Either is accepted and verified.
         let claims = self.identity.claims(&token).await.map_err(|e| {
             eprintln!("exchange: rejecting identity token: {e}");
             Status::unauthenticated("invalid identity token")
@@ -504,7 +505,7 @@ async fn main() -> Result<(), BoxError> {
         return run_admin(&args);
     }
 
-    let dex_issuer = env_required("KAGUYA_DEX_ISSUER")?;
+    let oidc_issuer = env_required("KAGUYA_OIDC_ISSUER")?;
     let audience = env_required("KAGUYA_JWT_AUDIENCE")?;
     let auth_issuer = env_required("KAGUYA_AUTH_ISSUER")?;
     let keys_dir = PathBuf::from(std::env::var("KAGUYA_KEYS_DIR").unwrap_or_else(|_| "/keys".into()));
@@ -513,28 +514,28 @@ async fn main() -> Result<(), BoxError> {
 
     // Publish our JWKS (just our signing key) before serving, so loreserver's
     // eager startup fetch and the container healthcheck find it. loreserver
-    // trusts only this issuer; Dex tokens never reach it.
+    // trusts only this issuer; OIDC tokens never reach it.
     jwks::publish(&keys_dir, signer.own_jwk())?;
 
     let store = Arc::new(Store::open(&db_path())?);
-    // Accept Dex tokens from the CLI/device client (LORE_HOST) and, if set, the
+    // Accept OIDC tokens from the CLI/device client (LORE_HOST) and, if set, the
     // web frontend client, whose `aud` differs.
-    let mut dex_audiences = vec![audience.clone()];
+    let mut oidc_audiences = vec![audience.clone()];
     if let Ok(web_aud) = std::env::var("KAGUYA_WEB_AUDIENCE") {
         if !web_aud.is_empty() {
-            dex_audiences.push(web_aud);
+            oidc_audiences.push(web_aud);
         }
     }
-    let dex = Arc::new(DexVerifier::new(dex_issuer.clone(), dex_audiences));
+    let oidc = Arc::new(OidcVerifier::new(oidc_issuer.clone(), oidc_audiences));
     let identity = Arc::new(Identity {
         self_verifier: SelfVerifier::new(signer.own_jwk(), auth_issuer.clone(), audience.clone())?,
-        dex: dex.clone(),
+        oidc: oidc.clone(),
     });
-    // Native login wraps Dex's device flow; the Dex client_id is LORE_HOST,
-    // which is also our audience.
-    let dexlogin = Arc::new(DexLogin::new(
+    // Native login wraps the provider's device flow; the OIDC client_id is
+    // LORE_HOST, which is also our audience.
+    let oidc_device = Arc::new(OidcDeviceLogin::new(
         reqwest::Client::new(),
-        dex_issuer.clone(),
+        oidc_issuer.clone(),
         audience.clone(),
     ));
     let sessions = Arc::new(Sessions::new());
@@ -545,10 +546,10 @@ async fn main() -> Result<(), BoxError> {
     };
     let auth = Auth {
         signer: signer.clone(),
-        dex,
+        oidc,
         store,
         identity,
-        dexlogin,
+        oidc_device,
         sessions,
         auth_issuer: auth_issuer.clone(),
         audience: audience.clone(),
@@ -557,7 +558,7 @@ async fn main() -> Result<(), BoxError> {
     let addr = "0.0.0.0:8080".parse()?;
     println!(
         "kaguya-auth listening on {addr}; issuer={auth_issuer}, audience={audience}, \
-         verifying Dex tokens from {dex_issuer}, db={}, kid={}",
+         verifying id tokens from {oidc_issuer}, db={}, kid={}",
         db_path(),
         signer.kid
     );

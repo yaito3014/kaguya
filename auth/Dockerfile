@@ -1,6 +1,6 @@
 FROM rust:slim AS builder
 # protobuf-compiler: build.rs codegen. build-essential: C toolchain for ring
-# (jsonwebtoken). pkg-config + libssl-dev: link native-tls (reqwest -> Dex JWKS).
+# (jsonwebtoken). pkg-config + libssl-dev: link native-tls (reqwest -> the IdP's JWKS).
 RUN apt-get update && apt-get install -y \
         protobuf-compiler build-essential pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -9,7 +9,7 @@ COPY . .
 RUN cargo build --release
 
 FROM debian:trixie-slim
-# ca-certificates: trust roots for the HTTPS fetch of Dex's JWKS. libssl3:
+# ca-certificates: trust roots for the HTTPS fetch of the IdP's JWKS. libssl3:
 # runtime for native-tls.
 RUN apt-get update && apt-get install -y ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/*

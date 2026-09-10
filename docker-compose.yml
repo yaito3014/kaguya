@@ -1,11 +1,11 @@
 # kaguya: Lore version-control server + Caddy (TLS edge) + auth (ReBAC), on its own VPS.
-# Uses the shared Dex IdP on iroha (https://dex.<domain>/dex) as its issuer.
+# Identity comes from an external Authentik IdP (the "lore" OIDC application).
 # Run ./setup.sh (after copying .env.example to .env) to render configs.
 #
 # No public loreserver image exists yet, so it is built from EpicGames/lore and
 # loaded here (see README). QUIC is UDP and cannot pass through Caddy; it is
 # published directly. Caddy issues the QUIC TLS cert (lore.<domain> site) and
-# Lore reads it from the shared caddy-data volume. The auth service verifies Dex
+# Lore reads it from the shared caddy-data volume. The auth service verifies OIDC
 # identities, enforces per-repository access from its ReBAC store, and mints the
 # repository-scoped tokens Lore accepts; it is internal only.
 
@@ -24,15 +24,14 @@ services:
   auth:
     image: kaguya-auth:0.2.0    # built from ./auth (see README)
     restart: unless-stopped
-    # Verifies the caller's Dex token and mints a repository-scoped Lore token
+    # Verifies the caller's OIDC id token and mints a repository-scoped Lore token
     # signed with its own key; also serves the all-allow ReBAC API. It never
     # needs to be published (clients reach token exchange via Caddy on
     # LORE_AUTH_HOST), so it stays on the internal compose network only.
     environment:
       # Issuer to verify incoming identity tokens against (the Authentik "lore"
-      # application), and their audience. (Env var name still says DEX; the value
-      # is the OIDC issuer — Authentik now, Dex before.)
-      KAGUYA_DEX_ISSUER: "${OIDC_ISSUER}"
+      # application), and their audience.
+      KAGUYA_OIDC_ISSUER: "${OIDC_ISSUER}"
       KAGUYA_JWT_AUDIENCE: "${LORE_HOST}"
       # Issuer stamped on minted tokens; must equal loreserver's jwt_issuer.
       KAGUYA_AUTH_ISSUER: "https://${LORE_AUTH_HOST}"
@@ -73,7 +72,7 @@ services:
     restart: unless-stopped
     # Read-only web frontend (BFF). The browser reaches it via Caddy on
     # LORE_WEB_HOST; it is internal only (no published ports). It logs users in
-    # through Dex and reads loreserver over gRPC per-user.
+    # through the OIDC provider and reads loreserver over gRPC per-user.
     depends_on:
       auth:
         condition: service_healthy
@@ -81,8 +80,8 @@ services:
         condition: service_started
     environment:
       # OIDC issuer = the Authentik "lore" application; client_id is shared with
-      # the CLI (one public provider). (Env name still says DEX; value is OIDC.)
-      KAGUYA_WEB_DEX_ISSUER: "${OIDC_ISSUER}"
+      # the CLI (one public provider).
+      KAGUYA_WEB_OIDC_ISSUER: "${OIDC_ISSUER}"
       KAGUYA_WEB_CLIENT_ID: "${LORE_OIDC_CLIENT_ID}"
       KAGUYA_WEB_REDIRECT_URI: "https://${LORE_WEB_HOST}/auth/callback"
       KAGUYA_WEB_AUTH_GRPC: "http://auth:8080"

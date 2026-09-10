@@ -8,9 +8,9 @@
 # ONE issuer: kaguya-auth. With native login the client's identity token is
 # minted by kaguya-auth too, so every token loreserver sees is signed by it —
 # the identity token on the authn-only repository service, and the exchanged
-# (resources-bearing) token on storage/revision. Dex is only the identity backend
-# kaguya-auth federates to at login; Dex tokens never reach loreserver. Note this
-# means the get-token.sh path (which stores a raw Dex token as the identity) no
+# (resources-bearing) token on storage/revision. The OIDC provider is only the identity backend
+# kaguya-auth federates to at login; its tokens never reach loreserver. Note this
+# means the get-token.sh path (which stores a raw OIDC id token as the identity) no
 # longer works; use `lore auth login`. jwt_audience is LORE_HOST.
 [server.auth]
 jwt_issuer = "https://{{LORE_AUTH_HOST}}"
@@ -38,7 +38,7 @@ enabled = true
 [environment.endpoint]
 # auth_url points at the kaguya-auth service (public, via Caddy). Both sides use
 # it: the client calls exchange_user_token_for_multiresource_token here to turn
-# its Dex identity into the repository-scoped token loreserver accepts, and the
+# its OIDC identity into the repository-scoped token loreserver accepts, and the
 # server builds an AuthClientAuthorizer that calls create_resource /
 # check_user_permission here (all-allow). Authentication is enforced by
 # [server.auth] above; scope now rides in the exchanged token's `resources`.

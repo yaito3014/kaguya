@@ -1,10 +1,10 @@
 // In-memory login-session table for the native device flow.
 //
-// StartAuthSession begins a Dex device authorization and stashes its
+// StartAuthSession begins a device authorization with the OIDC provider and stashes its
 // device_code (plus the token endpoint to poll and the caller's client_state)
 // under a fresh session_code returned to the client. GetAuthSession looks the
 // session back up by session_code, checks the client_state matches, and polls
-// Dex. Sessions are short-lived (the device code expires in minutes) and only
+// the OIDC provider. Sessions are short-lived (the device code expires in minutes) and only
 // matter mid-login, so keeping them in memory is fine: an auth-service restart
 // just means the user logs in again.
 use std::collections::HashMap;
@@ -81,7 +81,7 @@ mod tests {
         s.insert(
             code.to_string(),
             format!("dc-{code}"),
-            "https://dex/token".to_string(),
+            "https://idp/token".to_string(),
             state.to_string(),
             ttl,
         );
@@ -93,7 +93,7 @@ mod tests {
         insert(&s, "sess1", "state-a", Duration::from_secs(300));
         assert_eq!(
             s.resolve("sess1", "state-a"),
-            Some(("dc-sess1".to_string(), "https://dex/token".to_string()))
+            Some(("dc-sess1".to_string(), "https://idp/token".to_string()))
         );
     }
 

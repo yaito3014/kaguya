@@ -1,28 +1,29 @@
 # kaguya
 
 Self-hosted [Lore](https://github.com/EpicGames/lore) version-control server,
-authenticated by the shared Dex IdP on the **iroha** VPS.
+authenticated by an external **Authentik** IdP (the "lore" OIDC application).
 
 Lore speaks QUIC (UDP 41337) for clone/push, so it is published directly rather
 than through Caddy. Caddy issues the QUIC TLS certificate for `LORE_HOST`, and
 Lore reads it from the shared `caddy-data` volume.
 
-Authentication is a two-hop exchange. The client logs in to iroha's Dex (device
-flow) for identity. The `kaguya-auth` service then verifies that Dex token and
+Authentication is a two-hop exchange. The client logs in to Authentik (device
+flow) for identity. The `kaguya-auth` service then verifies that OIDC id token and
 mints a short-lived, repository-scoped token signed with its own key; loreserver
 verifies *that* token (issuer `https://<LORE_AUTH_HOST>`, audience `<LORE_HOST>`,
 JWKS read from the shared `auth-keys` volume). The scope loreserver's storage
-and revision services require lives in the minted token's `resources` claim — a
-raw Dex token carries none, which is why `kaguya-auth` re-issues it.
+and revision services require lives in the minted token's `resources` claim — the
+OIDC id token carries none, which is why `kaguya-auth` re-issues it.
 
 ## Requirements
 
 - A VPS with a public IP; ports 80/443 (ACME) and 41337 (TCP+UDP) open; Docker + Compose
 - An A record for `lore.` pointing at this VPS, DNS-only (grey cloud)
-- The `iroha` stack already running, with Dex reachable at `https://<DEX_HOST>/dex`
+- A reachable Authentik instance with a "lore" OIDC application; its issuer goes
+  in `OIDC_ISSUER` (e.g. `https://id.<domain>/application/o/lore/`)
 - A CNAME for `LORE_AUTH_HOST` pointing at this VPS (Caddy fronts `kaguya-auth`)
 - A CNAME for `LORE_WEB_HOST` pointing at this VPS (Caddy fronts the web frontend),
-  registered in iroha's Dex as a public client (see the web frontend section)
+  registered in Authentik as a redirect URI (see the web frontend section)
 - `python3` for `setup.sh`
 
 ## Build the images
@@ -53,26 +54,26 @@ the next token automatically.
 ## Quick start
 
     cp .env.example .env
-    $EDITOR .env          # LORE_HOST, DEX_HOST, LORE_AUTH_HOST
+    $EDITOR .env          # LORE_HOST, OIDC_ISSUER, LORE_AUTH_HOST
     ./setup.sh            # renders caddy + lore configs
     docker compose up -d
 
-Log in interactively — `kaguya-auth` runs the device flow against Dex for you:
+Log in interactively — `kaguya-auth` runs the device flow against Authentik for you:
 
     lore auth login lore://lore.yai.to:41337      # opens a browser
     lore auth login --no-browser lore://lore.yai.to:41337   # prints the URL instead
 
-This opens a Dex login page; approve it and the CLI stores the session.
-`kaguya-auth` verifies the Dex identity and issues its own signed token.
+This opens the Authentik login page; approve it and the CLI stores the session.
+`kaguya-auth` verifies the OIDC identity and issues its own signed token.
 
 **Refresh is not supported**: the `lore` client has no refresh call wired for
 this flow, so when the token expires you log in again (there is nothing to renew
-in the background). Tokens are issued with the Dex token's expiry.
+in the background). Tokens are issued with the OIDC id token's expiry.
 
 loreserver trusts only `kaguya-auth` as issuer, so the old `get-token.sh` /
-`--token-type lore` path (which hands the CLI a raw Dex token) no longer works:
-loreserver rejects the Dex-signed identity token. Use `lore auth login`.
-`examples/get-token.sh` is kept only as a reference for the Dex device flow.
+`--token-type lore` path (which hands the CLI a raw OIDC id token) no longer works:
+loreserver rejects the OIDC-signed identity token. Use `lore auth login`.
+`examples/get-token.sh` is kept only as a reference for the device flow.
 
 ## Authorization (ReBAC)
 
@@ -101,16 +102,16 @@ with `kaguya-auth grant <your-sub> <urc-id> owner`.
 ## Web frontend
 
 `LORE_WEB_HOST` (e.g. `app.lore.yai.to`) serves a read-only web UI — the `web`
-service, a Rust/axum BFF. Sign in with Dex, then browse the repositories you can
-access. It stores nothing: it logs you in via Dex (auth-code + PKCE), exchanges
-that identity through `kaguya-auth` for your Lore token, and reads loreserver
-over gRPC on your behalf, so the same per-user ReBAC applies — you see only your
-repositories.
+service, a Rust/axum BFF. Sign in with Authentik, then browse the repositories you
+can access. It stores nothing: it logs you in via the OIDC provider (auth-code +
+PKCE), exchanges that identity through `kaguya-auth` for your Lore token, and reads
+loreserver over gRPC on your behalf, so the same per-user ReBAC applies — you see
+only your repositories.
 
 Setup:
-- Register `LORE_WEB_HOST` as a **public** Dex client with redirect URI
-  `https://<LORE_WEB_HOST>/auth/callback` (iroha's `dex/config.yaml.tmpl` does
-  this from its own `LORE_WEB_HOST`). No client secret — the frontend uses PKCE.
+- In Authentik, the "lore" OIDC provider's client id is shared by the CLI and the
+  web frontend; add `https://<LORE_WEB_HOST>/auth/callback` to its redirect URIs.
+  The frontend is a public client — PKCE, no secret.
 - Point `LORE_WEB_HOST` (CNAME) at this VPS so Caddy can issue its certificate.
 
 Scope is read-only browsing (repositories now; branches/history/tree/file view as

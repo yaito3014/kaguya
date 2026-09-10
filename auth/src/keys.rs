@@ -1,13 +1,13 @@
 // Signing key management and Lore token minting.
 //
 // The auth service is the issuer of the "multiresource" tokens Lore verifies:
-// the client logs in to Dex, exchanges that identity here, and we hand back a
+// the client logs in to the OIDC provider, exchanges that identity here, and we hand back a
 // token signed with *our* key that carries the per-repository `resources` claim
 // Lore's storage/revision authorization (`verify_authorization`) requires.
 //
 // The private key is the source of truth, persisted (PKCS#8 PEM) in a shared
 // volume. Our public key is published as one JWK (`own_jwk`); the combined JWKS
-// loreserver reads (this key plus Dex's, see `jwks`) is assembled elsewhere.
+// loreserver reads (this key plus the IdP's, see `jwks`) is assembled elsewhere.
 // `kid` is the RFC 7638 thumbprint, so it changes if and only if the key does.
 use std::error::Error;
 use std::path::Path;
@@ -48,7 +48,7 @@ pub struct ResourceGrant {
 /// the `resources` grant list), and carries the display claims the lore CLI
 /// requires when it decodes the exchanged token: `name`, `preferred_username`
 /// and `is_service_account` (the deployed CLI treats `name` as mandatory, so we
-/// always emit it — carried over from the verified Dex identity).
+/// always emit it — carried over from the verified OIDC identity).
 #[derive(Serialize, Deserialize, Debug)]
 pub struct MintedClaims {
     pub iss: String,
@@ -71,7 +71,7 @@ pub struct Signer {
 impl Signer {
     /// Load the persisted signing key from `dir`, generating one on first run.
     /// Only the private key is written here; the published JWKS is assembled by
-    /// the caller (it also carries Dex's keys).
+    /// the caller (it also carries the IdP's keys).
     pub fn load_or_generate(dir: &Path) -> Result<Signer, BoxError> {
         std::fs::create_dir_all(dir)?;
         let key_path = dir.join(KEY_FILE);

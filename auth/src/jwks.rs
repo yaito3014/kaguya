@@ -1,10 +1,10 @@
 // Publication of the JWKS loreserver reads.
 //
 // loreserver trusts a single issuer, this service, so the published JWKS carries
-// only our signing key. Dex-issued tokens are never presented to loreserver
-// (native login mints our own token); Dex tokens are verified separately, during
-// login, by `verify::DexVerifier`, which fetches Dex's JWKS through `fetch_jwks`
-// below. Our key is static, so the file is written once at startup.
+// only our signing key. Tokens from the OIDC provider are never presented to
+// loreserver (native login mints our own token); they are verified separately,
+// during login, by `verify::OidcVerifier`, which fetches the IdP's JWKS through
+// `fetch_jwks` below. Our key is static, so the file is written once at startup.
 use std::error::Error;
 use std::path::Path;
 
@@ -20,8 +20,8 @@ struct DiscoveryDoc {
     jwks_uri: String,
 }
 
-/// Fetch an issuer's JWKS as raw JSON via OIDC discovery. Used by `DexVerifier`
-/// to verify Dex identity tokens during login.
+/// Fetch an issuer's JWKS as raw JSON via OIDC discovery. Used by `OidcVerifier`
+/// to verify the IdP's identity tokens during login.
 pub async fn fetch_jwks(client: &reqwest::Client, issuer: &str) -> Result<Value, String> {
     // Trim a trailing slash so an issuer like ".../o/lore/" does not yield a
     // double-slashed (404) well-known URL.

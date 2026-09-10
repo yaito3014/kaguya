@@ -1,25 +1,35 @@
 #!/bin/sh
-# Device-flow token helper: obtains a Lore access token from Dex.
+# Low-level device-flow reference: drives the OIDC device authorization grant
+# (RFC 8628) with curl and prints the provider's raw access token.
 #
-# Interactive login and refresh need UCS and do not work through Dex, so this
-# device-flow helper is the supported way to authenticate the lore CLI.
+# This is a reference only. The supported way to authenticate the lore CLI is
+# `lore auth login` (kaguya-auth runs this same device flow for you, then mints
+# the repository-scoped token loreserver actually trusts). loreserver rejects a
+# raw provider token, so the token printed here is not usable on its own.
 #
 # Usage:
-#   TOKEN=$(./get-token.sh)
-#   lore auth login --token-type lore --token "$TOKEN" lore://lore.yai.to:41337
+#   ./get-token.sh            # prints the access token (after you approve in a browser)
 #
 # Override the defaults with env vars if needed:
-#   DEX_URL (default https://dex.yai.to/dex), LORE_CLIENT_ID (default lore.yai.to)
+#   OIDC_ISSUER (default https://id.yai.to/application/o/lore/), LORE_CLIENT_ID (default lore.yai.to)
 set -eu
 
-DEX="${DEX_URL:-https://dex.yai.to/dex}"
+ISSUER="${OIDC_ISSUER:-https://id.yai.to/application/o/lore/}"
 CLIENT_ID="${LORE_CLIENT_ID:-lore.yai.to}"
 SCOPE="openid profile email"
 
 field() { python3 -c "import json,sys; print(json.load(sys.stdin).get('$1',''))"; }
 
+# 0. Discover the endpoints. Trim a trailing slash so an issuer like ".../o/lore/"
+#    does not yield a double-slashed (404) well-known URL.
+disco=$(curl -s "${ISSUER%/}/.well-known/openid-configuration")
+device_endpoint=$(printf '%s' "$disco" | field device_authorization_endpoint)
+token_endpoint=$(printf '%s' "$disco" | field token_endpoint)
+[ -n "$device_endpoint" ] && [ -n "$token_endpoint" ] || {
+    echo "discovery failed for $ISSUER: $disco" >&2; exit 1; }
+
 # 1. Device authorization request (RFC 8628)
-resp=$(curl -s -X POST "$DEX/device/code" -d "client_id=$CLIENT_ID" -d "scope=$SCOPE")
+resp=$(curl -s -X POST "$device_endpoint" -d "client_id=$CLIENT_ID" -d "scope=$SCOPE")
 device_code=$(printf '%s' "$resp" | field device_code)
 [ -n "$device_code" ] || { echo "device authorization failed: $resp" >&2; exit 1; }
 uri=$(printf '%s' "$resp" | field verification_uri_complete)
@@ -33,7 +43,7 @@ echo "  $uri" >&2
 # 2. Poll the token endpoint until the user approves
 while :; do
   sleep "$interval"
-  tok=$(curl -s -X POST "$DEX/token" \
+  tok=$(curl -s -X POST "$token_endpoint" \
     -d 'grant_type=urn:ietf:params:oauth:grant-type:device_code' \
     -d "device_code=$device_code" -d "client_id=$CLIENT_ID")
   access_token=$(printf '%s' "$tok" | field access_token)

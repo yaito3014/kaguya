@@ -1,6 +1,6 @@
 //! kaguya-web: a read-only web frontend (BFF) for the self-hosted Lore server.
 //!
-//! The browser talks only to this service. It logs the user in via Dex
+//! The browser talks only to this service. It logs the user in via the OIDC provider
 //! (auth-code + PKCE), exchanges that identity through kaguya-auth for a Lore
 //! token (see `authsvc`), keeps it in a server-side session, and reads
 //! repositories from loreserver over gRPC (see `lore`) on the user's behalf — so
@@ -168,7 +168,7 @@ struct Callback {
 
 async fn callback(State(app): State<Arc<App>>, Query(q): Query<Callback>) -> Response {
     if let Some(err) = q.error {
-        eprintln!("callback: Dex returned error: {err}");
+        eprintln!("callback: the IdP returned error: {err}");
         return redirect("/?login=failed", None);
     }
     let (Some(code), Some(state)) = (q.code, q.state) else {
@@ -249,7 +249,7 @@ fn env_req(key: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let issuer = env_or("KAGUYA_WEB_DEX_ISSUER", "https://dex.yai.to/dex");
+    let issuer = env_req("KAGUYA_WEB_OIDC_ISSUER")?;
     let client_id = env_req("KAGUYA_WEB_CLIENT_ID")?;
     let redirect_uri = env_req("KAGUYA_WEB_REDIRECT_URI")?;
     let auth_grpc = env_or("KAGUYA_WEB_AUTH_GRPC", "http://auth:8080");

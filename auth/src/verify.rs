@@ -1,13 +1,13 @@
-// Token verification: the incoming identity bearer, whether Dex-issued (the
-// get-token.sh path) or one we minted ourselves (native login / a forwarded
-// exchanged token).
+// Token verification: the incoming identity bearer, whether issued by the OIDC
+// provider (the get-token.sh path) or one we minted ourselves (native login / a
+// forwarded exchanged token).
 //
 // Before minting a repository-scoped token for an identity we verify the
 // bearer's signature, issuer, audience and expiry, so a forged or foreign bearer
-// cannot obtain access. `DexVerifier` checks Dex-signed tokens against Dex's JWKS
-// (fetched via OIDC discovery and cached; an unknown `kid` triggers one refetch,
-// covering key rotation); `SelfVerifier` checks tokens we signed against our own
-// key; `Identity` tries ours first, then Dex.
+// cannot obtain access. `OidcVerifier` checks the provider's tokens against the
+// IdP's JWKS (fetched via OIDC discovery and cached; an unknown `kid` triggers
+// one refetch, covering key rotation); `SelfVerifier` checks tokens we signed
+// against our own key; `Identity` tries ours first, then the OIDC provider.
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
@@ -21,7 +21,7 @@ use jsonwebtoken::Validation;
 use serde::Deserialize;
 use tokio::sync::RwLock;
 
-/// The identity claims we read off a verified token, whether a Dex identity
+/// The identity claims we read off a verified token, whether an OIDC identity
 /// token or one we minted ourselves. `sub`/`exp` carry into the minted Lore
 /// token; the optional display fields populate the exchange response.
 #[derive(Deserialize, Debug)]
@@ -90,9 +90,9 @@ mod canonical_subject_tests {
 pub enum VerifyError {
     /// The bearer is not a well-formed JWT, or carries no `kid`.
     Malformed(String),
-    /// No key with the token's `kid` in Dex's JWKS, even after a refresh.
+    /// No key with the token's `kid` in the IdP's JWKS, even after a refresh.
     UnknownKid(String),
-    /// Dex's JWKS could not be fetched or parsed.
+    /// The IdP's JWKS could not be fetched or parsed.
     Jwks(String),
     /// Signature, issuer, audience or expiry did not check out.
     Invalid(String),
@@ -102,8 +102,8 @@ impl fmt::Display for VerifyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             VerifyError::Malformed(m) => write!(f, "malformed token: {m}"),
-            VerifyError::UnknownKid(kid) => write!(f, "no Dex key for kid {kid}"),
-            VerifyError::Jwks(m) => write!(f, "Dex JWKS unavailable: {m}"),
+            VerifyError::UnknownKid(kid) => write!(f, "no IdP key for kid {kid}"),
+            VerifyError::Jwks(m) => write!(f, "IdP JWKS unavailable: {m}"),
             VerifyError::Invalid(m) => write!(f, "token rejected: {m}"),
         }
     }
@@ -111,18 +111,18 @@ impl fmt::Display for VerifyError {
 
 impl Error for VerifyError {}
 
-pub struct DexVerifier {
+pub struct OidcVerifier {
     issuer: String,
     audiences: Vec<String>,
     client: reqwest::Client,
     jwks: RwLock<Option<JwkSet>>,
 }
 
-impl DexVerifier {
-    /// `audiences` is every Dex client id whose tokens we accept: the CLI/device
+impl OidcVerifier {
+    /// `audiences` is every OIDC client id whose tokens we accept: the CLI/device
     /// client (LORE_HOST) and the web frontend client, which have different `aud`.
     pub fn new(issuer: String, audiences: Vec<String>) -> Self {
-        DexVerifier {
+        OidcVerifier {
             issuer,
             audiences,
             client: reqwest::Client::new(),
@@ -130,8 +130,8 @@ impl DexVerifier {
         }
     }
 
-    /// Verify a Dex bearer token, refetching the JWKS once if the token's key id
-    /// is not already cached.
+    /// Verify a bearer token from the OIDC provider, refetching the JWKS once if
+    /// the token's key id is not already cached.
     pub async fn verify(&self, token: &str) -> Result<IdentityClaims, VerifyError> {
         let kid = decode_header(token)
             .map_err(|e| VerifyError::Malformed(e.to_string()))?
@@ -160,7 +160,7 @@ impl DexVerifier {
 
 /// Verifier for tokens this service itself signed (the exchanged authz tokens),
 /// using our own public key. Lets us read the subject back out of a token
-/// loreserver forwards to the ReBAC RPCs without going to Dex.
+/// loreserver forwards to the ReBAC RPCs without going to the OIDC provider.
 pub struct SelfVerifier {
     key: DecodingKey,
     issuer: String,
@@ -199,20 +199,20 @@ impl SelfVerifier {
 
 /// Resolves the authenticated identity from whatever bearer we are handed: a
 /// token we signed (an authn token from native login, or an exchanged authz
-/// token loreserver forwards) or a raw Dex identity token (the get-token.sh
+/// token loreserver forwards) or a raw OIDC identity token (the get-token.sh
 /// path). Both are verified; an unverifiable bearer yields an error.
 pub struct Identity {
     pub self_verifier: SelfVerifier,
-    pub dex: Arc<DexVerifier>,
+    pub oidc: Arc<OidcVerifier>,
 }
 
 impl Identity {
-    /// The full identity claims, trying our own key first, then Dex.
+    /// The full identity claims, trying our own key first, then the OIDC provider.
     pub async fn claims(&self, bearer: &str) -> Result<IdentityClaims, VerifyError> {
         if let Some(claims) = self.self_verifier.claims(bearer) {
             return Ok(claims);
         }
-        self.dex.verify(bearer).await
+        self.oidc.verify(bearer).await
     }
 
     pub async fn subject(&self, bearer: &str) -> Result<String, VerifyError> {
@@ -221,7 +221,7 @@ impl Identity {
 }
 
 /// Verify a token against an already-resolved JWKS. Pure: no I/O, no caching, so
-/// the verification rules are testable without a live Dex.
+/// the verification rules are testable without a live IdP.
 pub fn verify_with_jwks(
     token: &str,
     jwks: &JwkSet,
@@ -270,11 +270,11 @@ mod tests {
     use std::time::SystemTime;
     use std::time::UNIX_EPOCH;
 
-    const ISS: &str = "https://dex.example.com/dex";
+    const ISS: &str = "https://idp.example.com";
     const AUD: &str = "lore.example.com";
     const KID: &str = "test-key";
 
-    // A stand-in Dex: an RSA key, plus the JWKS that publishes it. Kept entirely
+    // A stand-in IdP: an RSA key, plus the JWKS that publishes it. Kept entirely
     // local so the verification rules are exercised without a network.
     struct FakeIdp {
         encoding: EncodingKey,
@@ -321,7 +321,7 @@ mod tests {
     }
 
     #[test]
-    fn valid_dex_token_is_accepted() {
+    fn valid_oidc_token_is_accepted() {
         let idp = fake_idp();
         let token = sign(&idp, valid_claims());
         let claims = verify_with_jwks(&token, &idp.jwks, ISS, &[AUD.to_string()]).expect("valid token accepted");

@@ -1,4 +1,4 @@
-//! Dex OIDC: authorization-code flow with PKCE. The frontend is a public client
+//! OIDC authorization-code flow with PKCE. The frontend is a public client
 //! (no secret), so every login generates a PKCE verifier; the code challenge
 //! binds the callback's code to this login.
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -69,7 +69,7 @@ impl Oidc {
         Ok(url.to_string())
     }
 
-    /// Exchange the callback's authorization code for the Dex id_token.
+    /// Exchange the callback's authorization code for the OIDC id_token.
     pub async fn exchange_code(&self, code: &str, code_verifier: &str) -> Result<String, String> {
         let disco = self.discovery().await?;
         let resp: TokenResponse = self

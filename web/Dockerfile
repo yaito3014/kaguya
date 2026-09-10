@@ -1,6 +1,6 @@
 FROM rust:slim AS builder
 # protobuf-compiler: build.rs gRPC codegen. build-essential + pkg-config +
-# libssl-dev: link native-tls (reqwest -> Dex over HTTPS).
+# libssl-dev: link native-tls (reqwest -> the OIDC provider over HTTPS).
 RUN apt-get update && apt-get install -y \
         protobuf-compiler build-essential pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
