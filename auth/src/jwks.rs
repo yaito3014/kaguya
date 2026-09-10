@@ -23,7 +23,12 @@ struct DiscoveryDoc {
 /// Fetch an issuer's JWKS as raw JSON via OIDC discovery. Used by `DexVerifier`
 /// to verify Dex identity tokens during login.
 pub async fn fetch_jwks(client: &reqwest::Client, issuer: &str) -> Result<Value, String> {
-    let discovery_url = format!("{issuer}/.well-known/openid-configuration");
+    // Trim a trailing slash so an issuer like ".../o/lore/" does not yield a
+    // double-slashed (404) well-known URL.
+    let discovery_url = format!(
+        "{}/.well-known/openid-configuration",
+        issuer.trim_end_matches('/')
+    );
     let discovery: DiscoveryDoc = client
         .get(&discovery_url)
         .send()

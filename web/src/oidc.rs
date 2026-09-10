@@ -36,7 +36,12 @@ impl Oidc {
     }
 
     async fn discovery(&self) -> Result<Discovery, String> {
-        let url = format!("{}/.well-known/openid-configuration", self.issuer);
+        // Trim a trailing slash so an issuer like ".../o/lore/" does not yield a
+        // double-slashed (404) well-known URL.
+        let url = format!(
+            "{}/.well-known/openid-configuration",
+            self.issuer.trim_end_matches('/')
+        );
         self.client
             .get(&url)
             .send()
