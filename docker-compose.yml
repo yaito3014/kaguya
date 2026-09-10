@@ -6,8 +6,8 @@
 # loaded here (see README). QUIC is UDP and cannot pass through Caddy; it is
 # published directly. Caddy issues the QUIC TLS cert (lore.<domain> site) and
 # Lore reads it from the shared caddy-data volume. The auth service verifies Dex
-# identities and mints the repository-scoped tokens Lore accepts, and serves the
-# ReBAC gRPC API Lore expects (all-allow); it is internal only.
+# identities, enforces per-repository access from its ReBAC store, and mints the
+# repository-scoped tokens Lore accepts; it is internal only.
 
 services:
   caddy:
@@ -35,8 +35,10 @@ services:
       # Issuer stamped on minted tokens; must equal loreserver's jwt_issuer.
       KAGUYA_AUTH_ISSUER: "https://${LORE_AUTH_HOST}"
       KAGUYA_KEYS_DIR: "/keys"
+      KAGUYA_DB_PATH: "/data/rebac.db"   # ReBAC store (owners, grants, groups)
     volumes:
       - auth-keys:/keys        # private signing key + published JWKS (see lore)
+      - auth-data:/data        # ReBAC SQLite store
     # loreserver eagerly fetches the JWKS at startup and refuses to boot if it is
     # absent. This gate holds lore back until the auth service has written it, so
     # a fresh `up` does not crash-loop lore while the key is being generated.
@@ -69,3 +71,4 @@ volumes:
   caddy-config:
   lore-data:
   auth-keys:
+  auth-data:

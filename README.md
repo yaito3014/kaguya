@@ -60,13 +60,33 @@ device-flow helper `examples/get-token.sh` to get a token, then hand it to the C
     TOKEN=$(./examples/get-token.sh)
     lore auth login --token-type lore --token "$TOKEN" lore://lore.yai.to:41337
 
+## Authorization (ReBAC)
+
+`kaguya-auth` enforces per-repository access from a SQLite store (in the
+`auth-data` volume). Creating a repository records the creator as its **owner**;
+the exchange then mints a token scoped to exactly the repositories the caller may
+access, which is what loreserver's storage/revision authorization reads. A caller
+with no grant on a repository cannot clone or push it.
+
+Two roles: **owner** (access plus privileged operations — obliterate, admin,
+migrate) and **member** (access: clone and push). Lore's storage authorizes on
+the resource id alone, so there is no enforceable read-only role. Manage grants
+and groups with the binary's admin subcommands:
+
+    docker compose exec auth kaguya-auth grant  <subject> <urc-id> owner|member
+    docker compose exec auth kaguya-auth revoke <subject> <urc-id>
+    docker compose exec auth kaguya-auth group-add <group> <subject>
+    docker compose exec auth kaguya-auth group-del <group> <subject>
+    docker compose exec auth kaguya-auth ls <urc-id>
+
+`<subject>` is a user id (the JWT `sub`) or `group:<name>`. `<urc-id>` is
+`urc-<repository-id>` (the 32-hex id `lore` prints, e.g. from `lore status`).
+Repositories created before ReBAC was enabled have no recorded owner; grant one
+with `kaguya-auth grant <your-sub> <urc-id> owner`.
+
 ## Notes
 
 - **`[environment]` is undocumented upstream.** Re-check `lore/local.toml.tmpl`
   against the Lore source on upgrade (verified against v0.9.0).
 - The QUIC cert path in `lore/local.toml.tmpl` follows Caddy's ACME (Let's
   Encrypt) layout; if you change ACME CA, update the directory name.
-- Authorization is currently all-allow: `kaguya-auth` grants every requested
-  resource to any verified Dex identity (both in the minted token's `resources`
-  claim and in the ReBAC permission checks). Real per-repository policy — owners,
-  groups — goes in `kaguya-auth`, not in loreserver config.
