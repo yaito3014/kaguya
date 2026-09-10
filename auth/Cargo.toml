@@ -16,6 +16,7 @@ rsa = { version = "0.9", features = ["pem"] }
 sha2 = "0.10"
 rand = "0.8"
 reqwest = { version = "0.12", features = ["json"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14.2"

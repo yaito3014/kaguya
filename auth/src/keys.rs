@@ -34,12 +34,6 @@ use sha2::Sha256;
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
-// Actions granted on each resource. Lore's `verify_authorization` matches on the
-// resource id alone and never inspects `permission`, but these are the actions
-// loreserver names (obliterate/presign), so a granted token reads correctly to
-// any consumer that does look.
-pub const ALL_ACTIONS: &[&str] = &["obliterate", "presign"];
-
 const KEY_FILE: &str = "signing_key.pem";
 const RSA_BITS: usize = 2048;
 
@@ -121,9 +115,9 @@ impl Signer {
     }
 
     /// Mint a Lore token for `subject` (with the display `name` and
-    /// `preferred_username` carried from the verified identity), scoped to
-    /// `resource_ids` (each already in `urc-{repository}` form as the client
-    /// requested), expiring at `exp`.
+    /// `preferred_username` carried from the verified identity), carrying the
+    /// caller-supplied `resources` grants (already scoped to what the subject is
+    /// allowed, with per-role permissions), expiring at `exp`.
     #[allow(clippy::too_many_arguments)]
     pub fn mint(
         &self,
@@ -133,7 +127,7 @@ impl Signer {
         name: &str,
         preferred_username: &str,
         exp: u64,
-        resource_ids: &[String],
+        resources: Vec<ResourceGrant>,
     ) -> Result<String, BoxError> {
         let claims = MintedClaims {
             iss: issuer.to_string(),
@@ -144,18 +138,11 @@ impl Signer {
             name: name.to_string(),
             preferred_username: preferred_username.to_string(),
             is_service_account: false,
-            resources: resource_ids.iter().map(|id| grant(id.clone())).collect(),
+            resources,
         };
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(self.kid.clone());
         Ok(encode(&header, &claims, &self.encoding_key)?)
-    }
-}
-
-pub fn grant(resource_id: String) -> ResourceGrant {
-    ResourceGrant {
-        resource_id,
-        permission: ALL_ACTIONS.iter().map(|s| s.to_string()).collect(),
     }
 }
 
@@ -201,6 +188,15 @@ mod tests {
         Signer::load_or_generate(&dir).expect("generate signer")
     }
 
+    fn grants(ids: &[&str]) -> Vec<ResourceGrant> {
+        ids.iter()
+            .map(|id| ResourceGrant {
+                resource_id: id.to_string(),
+                permission: vec!["read".to_string(), "write".to_string()],
+            })
+            .collect()
+    }
+
     fn decoding_key(signer: &Signer) -> DecodingKey {
         let jwk: Jwk = serde_json::from_value(signer.own_jwk().clone()).expect("own jwk parses");
         DecodingKey::from_jwk(&jwk).expect("decoding key from jwk")
@@ -220,11 +216,10 @@ mod tests {
     #[test]
     fn minted_token_verifies_against_published_jwk() {
         let signer = signer();
-        let resources = vec!["urc-abc".to_string(), "urc-def".to_string()];
         let exp = now_secs() + 3600;
 
         let token = signer
-            .mint(ISS, AUD, "user-1", "User One", "user1", exp, &resources)
+            .mint(ISS, AUD, "user-1", "User One", "user1", exp, grants(&["urc-abc", "urc-def"]))
             .unwrap();
         let data = decode::<MintedClaims>(&token, &decoding_key(&signer), &validation())
             .expect("minted token must verify against its own JWK");
@@ -247,7 +242,7 @@ mod tests {
             .claims
             .resources
             .iter()
-            .all(|r| r.permission == vec!["obliterate", "presign"]));
+            .all(|r| r.permission == vec!["read", "write"]));
     }
 
     // Mirror of loreserver's `verify_authorization`: the resource the client will
@@ -255,9 +250,9 @@ mod tests {
     #[test]
     fn minted_token_authorizes_the_requested_repository() {
         let signer = signer();
-        let repo = "urc-0194b726b34e72b0b45550b88a967076".to_string();
+        let repo = "urc-0194b726b34e72b0b45550b88a967076";
         let token = signer
-            .mint(ISS, AUD, "u", "U", "u", now_secs() + 60, std::slice::from_ref(&repo))
+            .mint(ISS, AUD, "u", "U", "u", now_secs() + 60, grants(&[repo]))
             .unwrap();
         let data = decode::<MintedClaims>(&token, &decoding_key(&signer), &validation()).unwrap();
         assert!(data.claims.resources.iter().any(|r| r.resource_id == repo));
@@ -267,7 +262,7 @@ mod tests {
     fn wrong_audience_is_rejected() {
         let signer = signer();
         let token = signer
-            .mint(ISS, "someone-else", "u", "U", "u", now_secs() + 60, &["urc-x".into()])
+            .mint(ISS, "someone-else", "u", "U", "u", now_secs() + 60, grants(&["urc-x"]))
             .unwrap();
         decode::<MintedClaims>(&token, &decoding_key(&signer), &validation())
             .expect_err("a token minted for another audience must not verify");
@@ -277,7 +272,7 @@ mod tests {
     fn expired_token_is_rejected() {
         let signer = signer();
         let token = signer
-            .mint(ISS, AUD, "u", "U", "u", now_secs() - 3600, &["urc-x".into()])
+            .mint(ISS, AUD, "u", "U", "u", now_secs() - 3600, grants(&["urc-x"]))
             .unwrap();
         decode::<MintedClaims>(&token, &decoding_key(&signer), &validation())
             .expect_err("an expired token must not verify");

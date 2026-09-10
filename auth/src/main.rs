@@ -1,24 +1,21 @@
 // kaguya-auth: auth/ReBAC service for a Dex-fronted Lore server.
 //
 // Lore expects a UCS-style auth service for two things this fills:
-//   - the ReBAC gRPC API loreserver calls to create/authorize resources
-//     (RebacApi + UrcAuthApi.CheckUserPermission / LookupUserPermissions), and
 //   - token exchange: the client presents its Dex identity token here and
-//     receives a "multiresource" token that loreserver's storage/revision
-//     authorization accepts.
+//     receives a repository-scoped "multiresource" token loreserver accepts, and
+//   - the ReBAC gRPC API loreserver calls to create/authorize resources
+//     (RebacApi + UrcAuthApi.CheckUserPermission / LookupUserPermissions).
 //
-// The exchange is the load-bearing part. loreserver's `verify_authorization`
-// requires the presented token to carry a `resources` claim naming the
-// repository (`urc-{id}`); a plain Dex token has none. So we verify the Dex
-// token (signature/issuer/audience/expiry, see `verify`) and then MINT a fresh
-// RS256 token that carries the requested resource grants, signed with our own
-// key (see `keys`). loreserver trusts us as the issuer of exchanged tokens via
-// `[server.auth].jwt_issuer` + `[server.auth.jwk].endpoint = file://` pointing at
-// the JWKS we publish to the shared volume.
+// Authorization is real (not all-allow): a SQLite-backed store (see `store`)
+// records who owns / may access which repository. `CreateResource` records the
+// creator as owner; the exchange mints a token whose `resources` claim is scoped
+// to exactly what the caller is allowed (with per-role permissions), which is
+// what loreserver's storage/revision authorization reads. Grants and groups are
+// managed with the binary's admin subcommands (see `run_admin`).
 //
-// The ReBAC methods still grant every action to any caller; real per-repository
-// policy can be added there later. Authentication is enforced both by our Dex
-// verification above and by loreserver's own JWT check.
+// Identity still comes from Dex: the exchange verifies the caller's Dex token
+// (see `verify`) before minting, and the minted token is signed with our own key
+// (see `keys`), which loreserver trusts via `[server.auth]` + the published JWKS.
 use std::error::Error;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,10 +24,12 @@ use tonic::{transport::Server, Request, Response, Status};
 
 mod jwks;
 mod keys;
+mod store;
 mod verify;
 
-use keys::Signer;
-use verify::DexVerifier;
+use keys::{ResourceGrant, Signer};
+use store::{Role, Store};
+use verify::{DexVerifier, Identity, SelfVerifier};
 
 pub mod ucs_auth {
     include!(concat!(env!("OUT_DIR"), "/ucs.auth.rs"));
@@ -48,13 +47,11 @@ use ucs_auth::{
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
-// A proto ResourcePermission granting every action on `resource_id`, for the
-// ReBAC permission-check responses (distinct from the JWT resource grants in
-// `keys`, which are a different, serialized type).
-fn grant(resource_id: String) -> ResourcePermission {
+// A proto ResourcePermission carrying a role's permission strings.
+fn grant(resource_id: String, role: Role) -> ResourcePermission {
     ResourcePermission {
         resource_id,
-        permission: keys::ALL_ACTIONS.iter().map(|s| s.to_string()).collect(),
+        permission: role.permissions(),
     }
 }
 
@@ -68,21 +65,48 @@ fn bearer<T>(req: &Request<T>) -> String {
         .to_string()
 }
 
-#[derive(Default)]
-struct Rebac;
+struct Rebac {
+    store: Arc<Store>,
+    identity: Arc<Identity>,
+}
 
 #[tonic::async_trait]
 impl RebacApi for Rebac {
     async fn create_resource(
         &self,
-        _req: Request<CreateResourceRequest>,
+        req: Request<CreateResourceRequest>,
     ) -> Result<Response<CreateResourceResponse>, Status> {
+        let sub = self.identity.subject(&bearer(&req)).await.map_err(|e| {
+            eprintln!("create_resource: rejecting token: {e}");
+            Status::unauthenticated("invalid token")
+        })?;
+        let r = req.into_inner();
+        self.store
+            .record_owner(&sub, &r.resource_id, &r.resource_name)
+            .map_err(|e| {
+                eprintln!("create_resource: store error: {e}");
+                Status::internal("store error")
+            })?;
         Ok(Response::new(CreateResourceResponse {}))
     }
+
     async fn delete_resource(
         &self,
-        _req: Request<DeleteResourceRequest>,
+        req: Request<DeleteResourceRequest>,
     ) -> Result<Response<DeleteResourceResponse>, Status> {
+        let sub = self.identity.subject(&bearer(&req)).await.map_err(|e| {
+            eprintln!("delete_resource: rejecting token: {e}");
+            Status::unauthenticated("invalid token")
+        })?;
+        let r = req.into_inner();
+        // Only an owner may delete the resource.
+        if self.store.role_for(&sub, &r.resource_id) != Some(Role::Owner) {
+            return Err(Status::permission_denied("not an owner of this resource"));
+        }
+        self.store.delete_resource(&r.resource_id).map_err(|e| {
+            eprintln!("delete_resource: store error: {e}");
+            Status::internal("store error")
+        })?;
         Ok(Response::new(DeleteResourceResponse {}))
     }
 }
@@ -90,6 +114,8 @@ impl RebacApi for Rebac {
 struct Auth {
     signer: Arc<Signer>,
     dex: Arc<DexVerifier>,
+    store: Arc<Store>,
+    identity: Arc<Identity>,
     /// `iss` stamped on minted tokens; must equal loreserver's `jwt_issuer`.
     auth_issuer: String,
     /// `aud` stamped on minted tokens; must be in loreserver's `jwt_audience`.
@@ -111,10 +137,25 @@ impl UrcAuthApi for Auth {
         &self,
         req: Request<CheckUserPermissionRequest>,
     ) -> Result<Response<CheckUserPermissionResponse>, Status> {
+        let sub = self.identity.subject(&bearer(&req)).await.map_err(|e| {
+            eprintln!("check_user_permission: rejecting token: {e}");
+            Status::unauthenticated("invalid token")
+        })?;
         let ids = req.into_inner().resource_id;
+        let mut allowed = Vec::new();
+        let mut denied = Vec::new();
+        for id in ids {
+            match self.store.role_for(&sub, &id) {
+                Some(role) => allowed.push(grant(id, role)),
+                None => denied.push(ResourcePermission {
+                    resource_id: id,
+                    permission: vec![],
+                }),
+            }
+        }
         Ok(Response::new(CheckUserPermissionResponse {
-            allowed_resource_permission: ids.into_iter().map(grant).collect(),
-            denied_resource_permission: vec![],
+            allowed_resource_permission: allowed,
+            denied_resource_permission: denied,
         }))
     }
 
@@ -122,9 +163,24 @@ impl UrcAuthApi for Auth {
         &self,
         req: Request<LookupUserPermissionsRequest>,
     ) -> Result<Response<LookupUserPermissionsResponse>, Status> {
-        let filter = req.into_inner().resource_filter;
+        let sub = self.identity.subject(&bearer(&req)).await.map_err(|e| {
+            eprintln!("lookup_user_permissions: rejecting token: {e}");
+            Status::unauthenticated("invalid token")
+        })?;
+        // resource_filter is "urc"; every repository resource matches it, so we
+        // return all the caller can reach (single page — loreserver does not page).
+        let _ = req.into_inner();
+        let resource_permission = self
+            .store
+            .accessible(&sub)
+            .into_iter()
+            .map(|id| {
+                let role = self.store.role_for(&sub, &id).unwrap_or(Role::Member);
+                grant(id, role)
+            })
+            .collect();
         Ok(Response::new(LookupUserPermissionsResponse {
-            resource_permission: vec![grant(filter)],
+            resource_permission,
             next_page_token: None,
         }))
     }
@@ -176,9 +232,9 @@ impl UrcAuthApi for Auth {
     }
 
     /// Verify the caller's Dex token, then mint a Lore token scoped to the
-    /// requested resources. This is what makes `clone`/`push` authorize: the
-    /// minted token carries the `resources` grants loreserver's storage and
-    /// revision services require.
+    /// repositories the caller is actually allowed. Requested resources the
+    /// caller has no grant on are dropped, so loreserver's storage/revision
+    /// authorization (which reads the `resources` claim) denies them.
     async fn exchange_user_token_for_multiresource_token(
         &self,
         req: Request<ExchangeUserTokenForMultiresourceTokenRequest>,
@@ -193,10 +249,19 @@ impl UrcAuthApi for Auth {
             Status::unauthenticated("invalid identity token")
         })?;
 
-        let resource_ids = req.into_inner().resource_id;
-        // Display fields carried from the verified Dex identity. The lore CLI
-        // requires `name` when it decodes the exchanged token, so fall back to
-        // the username/email/subject rather than leaving it empty.
+        let requested = req.into_inner().resource_id;
+        let resources: Vec<ResourceGrant> = requested
+            .into_iter()
+            .filter_map(|id| {
+                self.store.role_for(&claims.sub, &id).map(|role| ResourceGrant {
+                    resource_id: id,
+                    permission: role.permissions(),
+                })
+            })
+            .collect();
+
+        // Display fields carried from the verified Dex identity; the lore CLI
+        // requires `name` when it decodes the exchanged token.
         let name = claims
             .name
             .clone()
@@ -218,14 +283,12 @@ impl UrcAuthApi for Auth {
                 &name,
                 &preferred_username,
                 claims.exp,
-                &resource_ids,
+                resources,
             )
             .map_err(|e| {
                 eprintln!("exchange: minting token failed: {e}");
                 Status::internal("token issuance failed")
             })?;
-
-        let user_name = name.clone();
 
         Ok(Response::new(
             ExchangeUserTokenForMultiresourceTokenResponse {
@@ -233,7 +296,7 @@ impl UrcAuthApi for Auth {
                     user_token: minted,
                     expires_at: claims.exp as i64,
                     user_id: claims.sub,
-                    user_name,
+                    user_name: name,
                 }),
             },
         ))
@@ -257,8 +320,64 @@ fn env_required(key: &str) -> Result<String, BoxError> {
     std::env::var(key).map_err(|_| format!("missing required env var {key}").into())
 }
 
+fn db_path() -> String {
+    std::env::var("KAGUYA_DB_PATH").unwrap_or_else(|_| "/data/rebac.db".into())
+}
+
+const ADMIN_USAGE: &str = "\
+usage: kaguya-auth <command>
+  grant <subject> <urc-id> <owner|member>   grant a role on a resource
+  revoke <subject> <urc-id>                  remove a grant
+  group-add <group> <subject>                add a subject to a group
+  group-del <group> <subject>                remove a subject from a group
+  ls <urc-id>                                list grants on a resource
+subjects are user ids (JWT sub) or 'group:<name>'. Run with no command to serve.";
+
+// Admin CLI: manage grants/groups directly against the ReBAC store. Runs when
+// the binary is invoked with arguments (e.g. `docker compose exec auth
+// kaguya-auth grant <sub> <urc-id> owner`), then exits without starting the
+// server.
+fn run_admin(args: &[String]) -> Result<(), BoxError> {
+    let store = Store::open(&db_path())?;
+    let rest: Vec<&str> = args[1..].iter().map(String::as_str).collect();
+    match (args[0].as_str(), rest.as_slice()) {
+        ("grant", [subject, urc, role]) => {
+            let role = Role::parse(role).ok_or("role must be 'owner' or 'member'")?;
+            store.grant(subject, urc, role)?;
+            println!("granted {} on {urc} to {subject}", role.as_str());
+        }
+        ("revoke", [subject, urc]) => {
+            let n = store.revoke(subject, urc)?;
+            println!("removed {n} grant(s) for {subject} on {urc}");
+        }
+        ("group-add", [group, subject]) => {
+            store.add_group_member(group, subject)?;
+            println!("added {subject} to group {group}");
+        }
+        ("group-del", [group, subject]) => {
+            let n = store.remove_group_member(group, subject)?;
+            println!("removed {n} membership(s) of {subject} in group {group}");
+        }
+        ("ls", [urc]) => {
+            for (subject, role) in store.list_grants(urc) {
+                println!("{role}\t{subject}");
+            }
+        }
+        _ => {
+            eprintln!("{ADMIN_USAGE}");
+            return Err("invalid admin command".into());
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if !args.is_empty() {
+        return run_admin(&args);
+    }
+
     let dex_issuer = env_required("KAGUYA_DEX_ISSUER")?;
     let audience = env_required("KAGUYA_JWT_AUDIENCE")?;
     let auth_issuer = env_required("KAGUYA_AUTH_ISSUER")?;
@@ -279,11 +398,22 @@ async fn main() -> Result<(), BoxError> {
         std::time::Duration::from_secs(300),
     );
 
+    let store = Arc::new(Store::open(&db_path())?);
     let dex = Arc::new(DexVerifier::new(dex_issuer.clone(), audience.clone()));
+    let identity = Arc::new(Identity {
+        self_verifier: SelfVerifier::new(signer.own_jwk(), auth_issuer.clone(), audience.clone())?,
+        dex: dex.clone(),
+    });
 
+    let rebac = Rebac {
+        store: store.clone(),
+        identity: identity.clone(),
+    };
     let auth = Auth {
         signer: signer.clone(),
         dex,
+        store,
+        identity,
         auth_issuer: auth_issuer.clone(),
         audience: audience.clone(),
     };
@@ -291,11 +421,12 @@ async fn main() -> Result<(), BoxError> {
     let addr = "0.0.0.0:8080".parse()?;
     println!(
         "kaguya-auth listening on {addr}; issuer={auth_issuer}, audience={audience}, \
-         verifying Dex tokens from {dex_issuer}, kid={}",
+         verifying Dex tokens from {dex_issuer}, db={}, kid={}",
+        db_path(),
         signer.kid
     );
     Server::builder()
-        .add_service(RebacApiServer::new(Rebac))
+        .add_service(RebacApiServer::new(rebac))
         .add_service(UrcAuthApiServer::new(auth))
         .serve(addr)
         .await?;

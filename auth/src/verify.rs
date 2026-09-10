@@ -9,6 +9,7 @@
 // whose `kid` is not cached triggers a single refetch (covering key rotation).
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 use jsonwebtoken::decode;
 use jsonwebtoken::decode_header;
@@ -100,6 +101,67 @@ impl DexVerifier {
             .await
             .map_err(VerifyError::Jwks)?;
         serde_json::from_value(value).map_err(|e| VerifyError::Jwks(format!("jwks parse: {e}")))
+    }
+}
+
+/// Verifier for tokens this service itself signed (the exchanged authz tokens),
+/// using our own public key. Lets us read the subject back out of a token
+/// loreserver forwards to the ReBAC RPCs without going to Dex.
+pub struct SelfVerifier {
+    key: DecodingKey,
+    issuer: String,
+    audience: String,
+}
+
+impl SelfVerifier {
+    pub fn new(
+        own_jwk: &serde_json::Value,
+        issuer: String,
+        audience: String,
+    ) -> Result<Self, VerifyError> {
+        let jwk: jsonwebtoken::jwk::Jwk = serde_json::from_value(own_jwk.clone())
+            .map_err(|e| VerifyError::Jwks(format!("own jwk: {e}")))?;
+        let key = DecodingKey::from_jwk(&jwk)
+            .map_err(|e| VerifyError::Jwks(format!("own jwk key: {e}")))?;
+        Ok(SelfVerifier {
+            key,
+            issuer,
+            audience,
+        })
+    }
+
+    /// The `sub` of a token we signed, or `None` if it is not one of ours (wrong
+    /// signature/issuer/audience or expired).
+    pub fn subject(&self, token: &str) -> Option<String> {
+        let mut v = Validation::new(Algorithm::RS256);
+        v.set_issuer(&[self.issuer.as_str()]);
+        v.set_audience(&[self.audience.as_str()]);
+        v.validate_exp = true;
+        decode::<SubClaim>(token, &self.key, &v)
+            .ok()
+            .map(|d| d.claims.sub)
+    }
+}
+
+#[derive(Deserialize)]
+struct SubClaim {
+    sub: String,
+}
+
+/// Resolves the authenticated subject from whatever bearer loreserver forwards
+/// to the ReBAC RPCs: a token we signed (the exchanged authz token) or a raw Dex
+/// identity token. Both are verified; an unverifiable bearer yields an error.
+pub struct Identity {
+    pub self_verifier: SelfVerifier,
+    pub dex: Arc<DexVerifier>,
+}
+
+impl Identity {
+    pub async fn subject(&self, bearer: &str) -> Result<String, VerifyError> {
+        if let Some(sub) = self.self_verifier.subject(bearer) {
+            return Ok(sub);
+        }
+        Ok(self.dex.verify(bearer).await?.sub)
     }
 }
 
