@@ -10,3 +10,9 @@
     # for the lore CLI and ReBAC for loreserver. Caddy terminates TLS here.
     reverse_proxy h2c://auth:8080
 }
+
+{{LORE_WEB_HOST}} {
+    # Read-only web frontend (kaguya-web BFF). Caddy terminates TLS and proxies
+    # to the internal HTTP service.
+    reverse_proxy web:8090
+}

@@ -3,3 +3,4 @@
 caddy/Caddyfile
 lore/local.toml
 auth/target
+web/target

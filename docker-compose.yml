@@ -36,6 +36,9 @@ services:
       KAGUYA_AUTH_ISSUER: "https://${LORE_AUTH_HOST}"
       KAGUYA_KEYS_DIR: "/keys"
       KAGUYA_DB_PATH: "/data/rebac.db"   # ReBAC store (owners, grants, groups)
+      # Also accept Dex tokens issued to the web frontend client (different aud),
+      # so ExchangeExternalTokenForUserToken can verify them.
+      KAGUYA_WEB_AUDIENCE: "${LORE_WEB_HOST}"
     volumes:
       - auth-keys:/keys        # private signing key + published JWKS (see lore)
       - auth-data:/data        # ReBAC SQLite store
@@ -65,6 +68,24 @@ services:
       - lore-data:/data                                    # immutable + mutable stores
       - caddy-data:/caddy-certs:ro                         # QUIC TLS cert issued by Caddy
       - auth-keys:/keys:ro     # JWKS for verifying exchanged tokens (file:// in local.toml)
+
+  web:
+    image: kaguya-web:0.1.0    # built from ./web (see README)
+    restart: unless-stopped
+    # Read-only web frontend (BFF). The browser reaches it via Caddy on
+    # LORE_WEB_HOST; it is internal only (no published ports). It logs users in
+    # through Dex and reads loreserver over gRPC per-user.
+    depends_on:
+      auth:
+        condition: service_healthy
+      lore:
+        condition: service_started
+    environment:
+      KAGUYA_WEB_DEX_ISSUER: "https://${DEX_HOST}/dex"
+      KAGUYA_WEB_CLIENT_ID: "${LORE_WEB_HOST}"
+      KAGUYA_WEB_REDIRECT_URI: "https://${LORE_WEB_HOST}/auth/callback"
+      KAGUYA_WEB_AUTH_GRPC: "http://auth:8080"
+      KAGUYA_WEB_LORE_GRPC: "http://lore:41337"
 
 volumes:
   caddy-data:

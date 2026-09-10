@@ -18,7 +18,7 @@ while IFS= read -r line || [ -n "$line" ]; do
     export "$key=$val"
 done < .env
 
-for v in LORE_HOST DEX_HOST LORE_AUTH_HOST; do
+for v in LORE_HOST DEX_HOST LORE_AUTH_HOST LORE_WEB_HOST; do
     eval "val=\${$v:-}"
     [ -n "$val" ] || { echo "error: $v is not set in .env" >&2; exit 1; }
 done
@@ -28,7 +28,7 @@ render() {
 import os, sys
 tmpl, out = sys.argv[1], sys.argv[2]
 text = open(tmpl).read()
-keys = ["LORE_HOST", "DEX_HOST", "LORE_AUTH_HOST"]
+keys = ["LORE_HOST", "DEX_HOST", "LORE_AUTH_HOST", "LORE_WEB_HOST"]
 for k in keys:
     text = text.replace("{{%s}}" % k, os.environ.get(k, ""))
 if "{{" in text:
@@ -38,7 +38,7 @@ print(f"rendered {out}")
 PYEOF
 }
 
-export LORE_HOST DEX_HOST LORE_AUTH_HOST
+export LORE_HOST DEX_HOST LORE_AUTH_HOST LORE_WEB_HOST
 
 render caddy/Caddyfile.tmpl  caddy/Caddyfile
 render lore/local.toml.tmpl  lore/local.toml

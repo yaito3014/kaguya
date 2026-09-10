@@ -21,6 +21,8 @@ raw Dex token carries none, which is why `kaguya-auth` re-issues it.
 - An A record for `lore.` pointing at this VPS, DNS-only (grey cloud)
 - The `iroha` stack already running, with Dex reachable at `https://<DEX_HOST>/dex`
 - A CNAME for `LORE_AUTH_HOST` pointing at this VPS (Caddy fronts `kaguya-auth`)
+- A CNAME for `LORE_WEB_HOST` pointing at this VPS (Caddy fronts the web frontend),
+  registered in iroha's Dex as a public client (see the web frontend section)
 - `python3` for `setup.sh`
 
 ## Build the images
@@ -35,11 +37,12 @@ builds from `./auth` in this repo.
     docker build --platform linux/amd64 -f lore-server/Dockerfile -t loreserver:v0.9.0 .
     cd -
 
-    # kaguya-auth, from this repo
+    # kaguya-auth and the web frontend, from this repo
     docker build --platform linux/amd64 -t kaguya-auth:0.2.0 ./auth
+    docker build --platform linux/amd64 -t kaguya-web:0.1.0 ./web
 
     # if built elsewhere, load them onto this VPS:
-    #   docker save loreserver:v0.9.0 kaguya-auth:0.2.0 | ssh kaguya 'docker load'
+    #   docker save loreserver:v0.9.0 kaguya-auth:0.2.0 kaguya-web:0.1.0 | ssh kaguya 'docker load'
 
 `kaguya-auth` generates its RSA signing key on first start and persists it in the
 `auth-keys` volume; it writes the public JWKS there too, and loreserver reads it
@@ -94,6 +97,24 @@ and groups with the binary's admin subcommands:
 `urc-<repository-id>` (the 32-hex id `lore` prints, e.g. from `lore status`).
 Repositories created before ReBAC was enabled have no recorded owner; grant one
 with `kaguya-auth grant <your-sub> <urc-id> owner`.
+
+## Web frontend
+
+`LORE_WEB_HOST` (e.g. `app.lore.yai.to`) serves a read-only web UI — the `web`
+service, a Rust/axum BFF. Sign in with Dex, then browse the repositories you can
+access. It stores nothing: it logs you in via Dex (auth-code + PKCE), exchanges
+that identity through `kaguya-auth` for your Lore token, and reads loreserver
+over gRPC on your behalf, so the same per-user ReBAC applies — you see only your
+repositories.
+
+Setup:
+- Register `LORE_WEB_HOST` as a **public** Dex client with redirect URI
+  `https://<LORE_WEB_HOST>/auth/callback` (iroha's `dex/config.yaml.tmpl` does
+  this from its own `LORE_WEB_HOST`). No client secret — the frontend uses PKCE.
+- Point `LORE_WEB_HOST` (CNAME) at this VPS so Caddy can issue its certificate.
+
+Scope is read-only browsing (repositories now; branches/history/tree/file view as
+it grows). There is no push from the web.
 
 ## Notes
 
