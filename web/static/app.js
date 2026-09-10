@@ -16,7 +16,7 @@ function showLogin() {
   app.innerHTML = `
     ${failed ? '<p class="error">Login failed. Please try again.</p>' : ""}
     <p>Sign in to browse the repositories you can access.</p>
-    <p><a class="btn" href="/auth/login">Sign in with Dex</a></p>`;
+    <p><a class="btn" href="/auth/login">Sign in</a></p>`;
 }
 
 async function showRepos() {
