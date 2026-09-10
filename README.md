@@ -54,8 +54,20 @@ the next token automatically.
     ./setup.sh            # renders caddy + lore configs
     docker compose up -d
 
-Interactive login and refresh need UCS and do not work through Dex, so use the
-device-flow helper `examples/get-token.sh` to get a token, then hand it to the CLI:
+Log in interactively — `kaguya-auth` runs the device flow against Dex for you:
+
+    lore auth login lore://lore.yai.to:41337      # opens a browser
+    lore auth login --no-browser lore://lore.yai.to:41337   # prints the URL instead
+
+This opens a Dex login page; approve it and the CLI stores the session.
+`kaguya-auth` verifies the Dex identity and issues its own signed token.
+
+**Refresh is not supported**: the `lore` client has no refresh call wired for
+this flow, so when the token expires you log in again (there is nothing to renew
+in the background). Tokens are issued with the Dex token's expiry.
+
+The non-interactive helper `examples/get-token.sh` still works as an alternative
+(e.g. for scripts), handing the CLI a Dex token directly:
 
     TOKEN=$(./examples/get-token.sh)
     lore auth login --token-type lore --token "$TOKEN" lore://lore.yai.to:41337
