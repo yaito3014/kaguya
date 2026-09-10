@@ -63,16 +63,18 @@ impl Error for VerifyError {}
 
 pub struct DexVerifier {
     issuer: String,
-    audience: String,
+    audiences: Vec<String>,
     client: reqwest::Client,
     jwks: RwLock<Option<JwkSet>>,
 }
 
 impl DexVerifier {
-    pub fn new(issuer: String, audience: String) -> Self {
+    /// `audiences` is every Dex client id whose tokens we accept: the CLI/device
+    /// client (LORE_HOST) and the web frontend client, which have different `aud`.
+    pub fn new(issuer: String, audiences: Vec<String>) -> Self {
         DexVerifier {
             issuer,
-            audience,
+            audiences,
             client: reqwest::Client::new(),
             jwks: RwLock::new(None),
         }
@@ -88,12 +90,12 @@ impl DexVerifier {
 
         if let Some(jwks) = self.jwks.read().await.as_ref() {
             if jwks.find(&kid).is_some() {
-                return verify_with_jwks(token, jwks, &self.issuer, &self.audience);
+                return verify_with_jwks(token, jwks, &self.issuer, &self.audiences);
             }
         }
 
         let fetched = self.fetch_jwks().await?;
-        let result = verify_with_jwks(token, &fetched, &self.issuer, &self.audience);
+        let result = verify_with_jwks(token, &fetched, &self.issuer, &self.audiences);
         *self.jwks.write().await = Some(fetched);
         result
     }
@@ -174,7 +176,7 @@ pub fn verify_with_jwks(
     token: &str,
     jwks: &JwkSet,
     issuer: &str,
-    audience: &str,
+    audiences: &[String],
 ) -> Result<IdentityClaims, VerifyError> {
     let kid = decode_header(token)
         .map_err(|e| VerifyError::Malformed(e.to_string()))?
@@ -192,7 +194,7 @@ pub fn verify_with_jwks(
     // its own algorithm (the classic RSA/HMAC confusion).
     let mut validation = Validation::new(Algorithm::RS256);
     validation.set_issuer(&[issuer]);
-    validation.set_audience(&[audience]);
+    validation.set_audience(audiences);
     validation.validate_exp = true;
 
     decode::<IdentityClaims>(token, &key, &validation)
@@ -272,7 +274,7 @@ mod tests {
     fn valid_dex_token_is_accepted() {
         let idp = fake_idp();
         let token = sign(&idp, valid_claims());
-        let claims = verify_with_jwks(&token, &idp.jwks, ISS, AUD).expect("valid token accepted");
+        let claims = verify_with_jwks(&token, &idp.jwks, ISS, &[AUD.to_string()]).expect("valid token accepted");
         assert_eq!(claims.sub, "abc-123");
     }
 
@@ -284,7 +286,7 @@ mod tests {
         let last = token.pop().unwrap();
         token.push(if last == 'A' { 'B' } else { 'A' });
         assert!(matches!(
-            verify_with_jwks(&token, &idp.jwks, ISS, AUD),
+            verify_with_jwks(&token, &idp.jwks, ISS, &[AUD.to_string()]),
             Err(VerifyError::Invalid(_))
         ));
     }
@@ -294,7 +296,7 @@ mod tests {
         let idp = fake_idp();
         let token = sign(&idp, json!({"iss": ISS, "aud": "other", "sub": "s", "exp": now() + 60}));
         assert!(matches!(
-            verify_with_jwks(&token, &idp.jwks, ISS, AUD),
+            verify_with_jwks(&token, &idp.jwks, ISS, &[AUD.to_string()]),
             Err(VerifyError::Invalid(_))
         ));
     }
@@ -307,7 +309,7 @@ mod tests {
             json!({"iss": "https://evil.example.com", "aud": AUD, "sub": "s", "exp": now() + 60}),
         );
         assert!(matches!(
-            verify_with_jwks(&token, &idp.jwks, ISS, AUD),
+            verify_with_jwks(&token, &idp.jwks, ISS, &[AUD.to_string()]),
             Err(VerifyError::Invalid(_))
         ));
     }
@@ -317,7 +319,7 @@ mod tests {
         let idp = fake_idp();
         let token = sign(&idp, json!({"iss": ISS, "aud": AUD, "sub": "s", "exp": now() - 3600}));
         assert!(matches!(
-            verify_with_jwks(&token, &idp.jwks, ISS, AUD),
+            verify_with_jwks(&token, &idp.jwks, ISS, &[AUD.to_string()]),
             Err(VerifyError::Invalid(_))
         ));
     }
@@ -329,7 +331,7 @@ mod tests {
         let token = sign(&other, valid_claims());
         // Same kid, different key material -> signature fails, not an unknown kid.
         assert!(matches!(
-            verify_with_jwks(&token, &idp.jwks, ISS, AUD),
+            verify_with_jwks(&token, &idp.jwks, ISS, &[AUD.to_string()]),
             Err(VerifyError::Invalid(_))
         ));
 
@@ -338,7 +340,7 @@ mod tests {
         header.kid = Some("nonexistent".to_string());
         let token = encode(&header, &valid_claims(), &idp.encoding).unwrap();
         assert!(matches!(
-            verify_with_jwks(&token, &idp.jwks, ISS, AUD),
+            verify_with_jwks(&token, &idp.jwks, ISS, &[AUD.to_string()]),
             Err(VerifyError::UnknownKid(_))
         ));
     }

@@ -317,13 +317,46 @@ impl UrcAuthApi for Auth {
     ) -> Result<Response<VerifyUserResponse>, Status> {
         Err(Status::unimplemented("verify_user"))
     }
+    /// Exchange an external IdP token (a Dex token from the web frontend's OIDC
+    /// login) for our own signed authn token. The web BFF calls this once after
+    /// login, then uses the returned token as the user's Lore identity — same as
+    /// the token native login mints, just obtained via the auth-code flow.
     async fn exchange_external_token_for_user_token(
         &self,
-        _req: Request<ExchangeExternalTokenForUserTokenRequest>,
+        req: Request<ExchangeExternalTokenForUserTokenRequest>,
     ) -> Result<Response<ExchangeExternalTokenForUserTokenResponse>, Status> {
-        Err(Status::unimplemented(
-            "exchange_external_token_for_user_token",
-        ))
+        let external = req.into_inner().external_token;
+        if external.is_empty() {
+            return Err(Status::unauthenticated("missing external token"));
+        }
+        let claims = self.dex.verify(&external).await.map_err(|e| {
+            eprintln!("exchange_external: rejecting external token: {e}");
+            Status::unauthenticated("invalid external token")
+        })?;
+        let (name, preferred_username) = display_names(&claims);
+        let authn = self
+            .signer
+            .mint(
+                &self.auth_issuer,
+                &self.audience,
+                &claims.sub,
+                &name,
+                &preferred_username,
+                claims.exp,
+                vec![],
+            )
+            .map_err(|e| {
+                eprintln!("exchange_external: mint failed: {e}");
+                Status::internal("token issuance failed")
+            })?;
+        Ok(Response::new(ExchangeExternalTokenForUserTokenResponse {
+            user_token: Some(UserToken {
+                user_token: authn,
+                expires_at: claims.exp as i64,
+                user_id: claims.sub,
+                user_name: name,
+            }),
+        }))
     }
     async fn exchange_api_key_for_user_token(
         &self,
@@ -482,7 +515,15 @@ async fn main() -> Result<(), BoxError> {
     jwks::publish(&keys_dir, signer.own_jwk())?;
 
     let store = Arc::new(Store::open(&db_path())?);
-    let dex = Arc::new(DexVerifier::new(dex_issuer.clone(), audience.clone()));
+    // Accept Dex tokens from the CLI/device client (LORE_HOST) and, if set, the
+    // web frontend client, whose `aud` differs.
+    let mut dex_audiences = vec![audience.clone()];
+    if let Ok(web_aud) = std::env::var("KAGUYA_WEB_AUDIENCE") {
+        if !web_aud.is_empty() {
+            dex_audiences.push(web_aud);
+        }
+    }
+    let dex = Arc::new(DexVerifier::new(dex_issuer.clone(), dex_audiences));
     let identity = Arc::new(Identity {
         self_verifier: SelfVerifier::new(signer.own_jwk(), auth_issuer.clone(), audience.clone())?,
         dex: dex.clone(),
