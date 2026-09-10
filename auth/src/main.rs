@@ -262,19 +262,20 @@ impl UrcAuthApi for Auth {
 
         match self.dexlogin.poll(&token_endpoint, &device_code).await {
             Ok(Poll::Pending) => Ok(Response::new(GetAuthSessionResponse { user_token: None })),
-            Ok(Poll::Token(dex_access)) => {
-                let claims = self.dex.verify(&dex_access).await.map_err(|e| {
+            Ok(Poll::Token(dex_token)) => {
+                let claims = self.dex.verify(&dex_token).await.map_err(|e| {
                     eprintln!("get_auth_session: dex token rejected: {e}");
                     Status::internal("login token invalid")
                 })?;
                 self.sessions.remove(&r.session_code);
+                let subject = claims.canonical_subject();
                 let (name, preferred_username) = display_names(&claims);
                 let authn = self
                     .signer
                     .mint(
                         &self.auth_issuer,
                         &self.audience,
-                        &claims.sub,
+                        &subject,
                         &name,
                         &preferred_username,
                         claims.exp,
@@ -288,7 +289,7 @@ impl UrcAuthApi for Auth {
                     user_token: Some(UserToken {
                         user_token: authn,
                         expires_at: claims.exp as i64,
-                        user_id: claims.sub,
+                        user_id: subject,
                         user_name: name,
                     }),
                 }))
@@ -333,13 +334,14 @@ impl UrcAuthApi for Auth {
             eprintln!("exchange_external: rejecting external token: {e}");
             Status::unauthenticated("invalid external token")
         })?;
+        let subject = claims.canonical_subject();
         let (name, preferred_username) = display_names(&claims);
         let authn = self
             .signer
             .mint(
                 &self.auth_issuer,
                 &self.audience,
-                &claims.sub,
+                &subject,
                 &name,
                 &preferred_username,
                 claims.exp,
@@ -353,7 +355,7 @@ impl UrcAuthApi for Auth {
             user_token: Some(UserToken {
                 user_token: authn,
                 expires_at: claims.exp as i64,
-                user_id: claims.sub,
+                user_id: subject,
                 user_name: name,
             }),
         }))

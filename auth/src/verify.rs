@@ -34,6 +34,56 @@ pub struct IdentityClaims {
     pub name: Option<String>,
     #[serde(default)]
     pub email: Option<String>,
+    #[serde(default)]
+    pub email_verified: Option<bool>,
+}
+
+impl IdentityClaims {
+    /// The canonical account id. A **verified** email (lowercased) unifies the
+    /// same person's logins across connectors (password, GitHub, …) into one
+    /// account; without a verified email we fall back to the connector-specific
+    /// subject, so an unverified or missing email can never collide with
+    /// someone else's account.
+    pub fn canonical_subject(&self) -> String {
+        match (&self.email, self.email_verified) {
+            (Some(email), Some(true)) if !email.is_empty() => email.to_lowercase(),
+            _ => self.sub.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod canonical_subject_tests {
+    use super::IdentityClaims;
+
+    fn claims(email: Option<&str>, verified: Option<bool>) -> IdentityClaims {
+        IdentityClaims {
+            sub: "Cixxxxxxx".to_string(),
+            exp: 0,
+            preferred_username: None,
+            name: None,
+            email: email.map(String::from),
+            email_verified: verified,
+        }
+    }
+
+    #[test]
+    fn verified_email_is_the_canonical_subject_lowercased() {
+        assert_eq!(
+            claims(Some("User@Example.com"), Some(true)).canonical_subject(),
+            "user@example.com"
+        );
+    }
+
+    #[test]
+    fn unverified_or_missing_email_falls_back_to_the_connector_subject() {
+        assert_eq!(
+            claims(Some("u@example.com"), Some(false)).canonical_subject(),
+            "Cixxxxxxx"
+        );
+        assert_eq!(claims(Some("u@example.com"), None).canonical_subject(), "Cixxxxxxx");
+        assert_eq!(claims(None, Some(true)).canonical_subject(), "Cixxxxxxx");
+    }
 }
 
 #[derive(Debug)]

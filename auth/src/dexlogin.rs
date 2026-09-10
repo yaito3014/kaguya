@@ -23,6 +23,7 @@ struct DeviceCodeResponse {
 
 #[derive(Deserialize)]
 struct TokenResponse {
+    id_token: Option<String>,
     access_token: Option<String>,
     error: Option<String>,
 }
@@ -124,13 +125,22 @@ impl DexLogin {
         let body = resp.text().await.map_err(|e| format!("token read: {e}"))?;
         let parsed: TokenResponse =
             serde_json::from_str(&body).map_err(|e| format!("token parse: {e}"))?;
-        Ok(classify(parsed.access_token, parsed.error))
+        Ok(classify(parsed.id_token, parsed.access_token, parsed.error))
     }
 }
 
 /// Classify a token-endpoint response. `authorization_pending` and `slow_down`
-/// mean keep polling; a token means done; any other error is terminal.
-fn classify(access_token: Option<String>, error: Option<String>) -> Poll {
+/// mean keep polling; a token means done; any other error is terminal. We hand
+/// back the id_token (it carries email/email_verified, which the access token
+/// may not), falling back to the access token only if no id_token was returned.
+fn classify(
+    id_token: Option<String>,
+    access_token: Option<String>,
+    error: Option<String>,
+) -> Poll {
+    if let Some(token) = id_token.filter(|t| !t.is_empty()) {
+        return Poll::Token(token);
+    }
     if let Some(token) = access_token.filter(|t| !t.is_empty()) {
         return Poll::Token(token);
     }
@@ -145,21 +155,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_token_is_success() {
+    fn id_token_is_preferred_and_is_success() {
         assert!(matches!(
-            classify(Some("abc".to_string()), None),
-            Poll::Token(t) if t == "abc"
+            classify(Some("idt".to_string()), Some("acc".to_string()), None),
+            Poll::Token(t) if t == "idt"
+        ));
+    }
+
+    #[test]
+    fn access_token_is_used_when_no_id_token() {
+        assert!(matches!(
+            classify(None, Some("acc".to_string()), None),
+            Poll::Token(t) if t == "acc"
         ));
     }
 
     #[test]
     fn authorization_pending_keeps_polling() {
         assert!(matches!(
-            classify(None, Some("authorization_pending".to_string())),
+            classify(None, None, Some("authorization_pending".to_string())),
             Poll::Pending
         ));
         assert!(matches!(
-            classify(None, Some("slow_down".to_string())),
+            classify(None, None, Some("slow_down".to_string())),
             Poll::Pending
         ));
     }
@@ -167,17 +185,20 @@ mod tests {
     #[test]
     fn other_errors_are_terminal() {
         assert!(matches!(
-            classify(None, Some("expired_token".to_string())),
+            classify(None, None, Some("expired_token".to_string())),
             Poll::Denied(e) if e == "expired_token"
         ));
         assert!(matches!(
-            classify(None, Some("access_denied".to_string())),
+            classify(None, None, Some("access_denied".to_string())),
             Poll::Denied(_)
         ));
     }
 
     #[test]
-    fn empty_token_is_not_success() {
-        assert!(matches!(classify(Some(String::new()), None), Poll::Pending));
+    fn empty_tokens_are_not_success() {
+        assert!(matches!(
+            classify(Some(String::new()), Some(String::new()), None),
+            Poll::Pending
+        ));
     }
 }
