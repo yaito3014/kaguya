@@ -29,16 +29,15 @@ services:
     # needs to be published (clients reach token exchange via Caddy on
     # LORE_AUTH_HOST), so it stays on the internal compose network only.
     environment:
-      # Issuer to verify incoming Dex identity tokens against, and their audience.
-      KAGUYA_DEX_ISSUER: "https://${DEX_HOST}/dex"
+      # Issuer to verify incoming identity tokens against (the Authentik "lore"
+      # application), and their audience. (Env var name still says DEX; the value
+      # is the OIDC issuer — Authentik now, Dex before.)
+      KAGUYA_DEX_ISSUER: "${OIDC_ISSUER}"
       KAGUYA_JWT_AUDIENCE: "${LORE_HOST}"
       # Issuer stamped on minted tokens; must equal loreserver's jwt_issuer.
       KAGUYA_AUTH_ISSUER: "https://${LORE_AUTH_HOST}"
       KAGUYA_KEYS_DIR: "/keys"
       KAGUYA_DB_PATH: "/data/rebac.db"   # ReBAC store (owners, grants, groups)
-      # Also accept Dex tokens issued to the web frontend client (different aud),
-      # so ExchangeExternalTokenForUserToken can verify them.
-      KAGUYA_WEB_AUDIENCE: "${LORE_WEB_HOST}"
     volumes:
       - auth-keys:/keys        # private signing key + published JWKS (see lore)
       - auth-data:/data        # ReBAC SQLite store
@@ -81,8 +80,10 @@ services:
       lore:
         condition: service_started
     environment:
-      KAGUYA_WEB_DEX_ISSUER: "https://${DEX_HOST}/dex"
-      KAGUYA_WEB_CLIENT_ID: "${LORE_WEB_HOST}"
+      # OIDC issuer = the Authentik "lore" application; client_id is shared with
+      # the CLI (one public provider). (Env name still says DEX; value is OIDC.)
+      KAGUYA_WEB_DEX_ISSUER: "${OIDC_ISSUER}"
+      KAGUYA_WEB_CLIENT_ID: "${LORE_OIDC_CLIENT_ID}"
       KAGUYA_WEB_REDIRECT_URI: "https://${LORE_WEB_HOST}/auth/callback"
       KAGUYA_WEB_AUTH_GRPC: "http://auth:8080"
       KAGUYA_WEB_LORE_GRPC: "http://lore:41337"
