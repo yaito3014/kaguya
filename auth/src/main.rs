@@ -22,14 +22,18 @@ use std::sync::Arc;
 
 use tonic::{transport::Server, Request, Response, Status};
 
+mod dexlogin;
 mod jwks;
 mod keys;
+mod sessions;
 mod store;
 mod verify;
 
+use dexlogin::{DexLogin, Poll};
 use keys::{ResourceGrant, Signer};
+use sessions::Sessions;
 use store::{Role, Store};
-use verify::{DexVerifier, Identity, SelfVerifier};
+use verify::{DexVerifier, Identity, IdentityClaims, SelfVerifier};
 
 pub mod ucs_auth {
     include!(concat!(env!("OUT_DIR"), "/ucs.auth.rs"));
@@ -116,10 +120,35 @@ struct Auth {
     dex: Arc<DexVerifier>,
     store: Arc<Store>,
     identity: Arc<Identity>,
+    dexlogin: Arc<DexLogin>,
+    sessions: Arc<Sessions>,
     /// `iss` stamped on minted tokens; must equal loreserver's `jwt_issuer`.
     auth_issuer: String,
     /// `aud` stamped on minted tokens; must be in loreserver's `jwt_audience`.
     audience: String,
+}
+
+/// Display fields for a minted token, carried from the verified identity. The
+/// lore CLI requires `name`, so we fall back through username/email/subject
+/// rather than leaving it empty.
+fn display_names(claims: &IdentityClaims) -> (String, String) {
+    let name = claims
+        .name
+        .clone()
+        .or_else(|| claims.preferred_username.clone())
+        .or_else(|| claims.email.clone())
+        .unwrap_or_else(|| claims.sub.clone());
+    let preferred_username = claims
+        .preferred_username
+        .clone()
+        .or_else(|| claims.email.clone())
+        .unwrap_or_else(|| name.clone());
+    (name, preferred_username)
+}
+
+/// An unguessable opaque id for a login session_code.
+fn random_id() -> String {
+    format!("{:032x}", rand::random::<u128>())
 }
 
 #[tonic::async_trait]
@@ -192,17 +221,89 @@ impl UrcAuthApi for Auth {
         Ok(Response::new(GetUserInfoResponse { user_info: vec![] }))
     }
 
+    /// Begin native interactive login: start a Dex device authorization and hand
+    /// the client Dex's verification URL plus a session_code to poll with.
     async fn start_auth_session(
         &self,
-        _req: Request<StartAuthSessionRequest>,
+        req: Request<StartAuthSessionRequest>,
     ) -> Result<Response<StartAuthSessionResponse>, Status> {
-        Err(Status::unimplemented("start_auth_session"))
+        let client_state = req.into_inner().client_state;
+        let start = self.dexlogin.start().await.map_err(|e| {
+            eprintln!("start_auth_session: {e}");
+            Status::internal("could not start login")
+        })?;
+        let session_code = random_id();
+        let ttl = std::time::Duration::from_secs(start.expires_in.clamp(60, 600));
+        self.sessions.insert(
+            session_code.clone(),
+            start.device_code,
+            start.token_endpoint,
+            client_state,
+            ttl,
+        );
+        Ok(Response::new(StartAuthSessionResponse {
+            session_code,
+            login_url: start.login_url,
+        }))
     }
+
+    /// Poll a login session: return no token while the user is still authorizing,
+    /// or, once Dex issues a token, mint and return our own authn token (which the
+    /// client stores as its identity and re-presents to the exchange).
     async fn get_auth_session(
         &self,
-        _req: Request<GetAuthSessionRequest>,
+        req: Request<GetAuthSessionRequest>,
     ) -> Result<Response<GetAuthSessionResponse>, Status> {
-        Err(Status::unimplemented("get_auth_session"))
+        let r = req.into_inner();
+        let (device_code, token_endpoint) = self
+            .sessions
+            .resolve(&r.session_code, &r.client_state)
+            .ok_or_else(|| Status::not_found("unknown or expired login session"))?;
+
+        match self.dexlogin.poll(&token_endpoint, &device_code).await {
+            Ok(Poll::Pending) => Ok(Response::new(GetAuthSessionResponse { user_token: None })),
+            Ok(Poll::Token(dex_access)) => {
+                let claims = self.dex.verify(&dex_access).await.map_err(|e| {
+                    eprintln!("get_auth_session: dex token rejected: {e}");
+                    Status::internal("login token invalid")
+                })?;
+                self.sessions.remove(&r.session_code);
+                let (name, preferred_username) = display_names(&claims);
+                let authn = self
+                    .signer
+                    .mint(
+                        &self.auth_issuer,
+                        &self.audience,
+                        &claims.sub,
+                        &name,
+                        &preferred_username,
+                        claims.exp,
+                        vec![], // an identity token carries no resource grants
+                    )
+                    .map_err(|e| {
+                        eprintln!("get_auth_session: mint failed: {e}");
+                        Status::internal("token issuance failed")
+                    })?;
+                Ok(Response::new(GetAuthSessionResponse {
+                    user_token: Some(UserToken {
+                        user_token: authn,
+                        expires_at: claims.exp as i64,
+                        user_id: claims.sub,
+                        user_name: name,
+                    }),
+                }))
+            }
+            Ok(Poll::Denied(e)) => {
+                self.sessions.remove(&r.session_code);
+                Err(Status::permission_denied(format!(
+                    "login not completed: {e}"
+                )))
+            }
+            Err(e) => {
+                eprintln!("get_auth_session: poll error: {e}");
+                Err(Status::internal("login poll failed"))
+            }
+        }
     }
     async fn refresh_auth_session(
         &self,
@@ -244,7 +345,9 @@ impl UrcAuthApi for Auth {
             return Err(Status::unauthenticated("missing bearer token"));
         }
 
-        let claims = self.dex.verify(&token).await.map_err(|e| {
+        // The bearer is the caller's identity token: our own authn token (native
+        // login) or a Dex token (get-token.sh). Either is accepted and verified.
+        let claims = self.identity.claims(&token).await.map_err(|e| {
             eprintln!("exchange: rejecting identity token: {e}");
             Status::unauthenticated("invalid identity token")
         })?;
@@ -260,19 +363,7 @@ impl UrcAuthApi for Auth {
             })
             .collect();
 
-        // Display fields carried from the verified Dex identity; the lore CLI
-        // requires `name` when it decodes the exchanged token.
-        let name = claims
-            .name
-            .clone()
-            .or_else(|| claims.preferred_username.clone())
-            .or_else(|| claims.email.clone())
-            .unwrap_or_else(|| claims.sub.clone());
-        let preferred_username = claims
-            .preferred_username
-            .clone()
-            .or_else(|| claims.email.clone())
-            .unwrap_or_else(|| name.clone());
+        let (name, preferred_username) = display_names(&claims);
 
         let minted = self
             .signer
@@ -404,6 +495,14 @@ async fn main() -> Result<(), BoxError> {
         self_verifier: SelfVerifier::new(signer.own_jwk(), auth_issuer.clone(), audience.clone())?,
         dex: dex.clone(),
     });
+    // Native login wraps Dex's device flow; the Dex client_id is LORE_HOST,
+    // which is also our audience.
+    let dexlogin = Arc::new(DexLogin::new(
+        reqwest::Client::new(),
+        dex_issuer.clone(),
+        audience.clone(),
+    ));
+    let sessions = Arc::new(Sessions::new());
 
     let rebac = Rebac {
         store: store.clone(),
@@ -414,6 +513,8 @@ async fn main() -> Result<(), BoxError> {
         dex,
         store,
         identity,
+        dexlogin,
+        sessions,
         auth_issuer: auth_issuer.clone(),
         audience: audience.clone(),
     };

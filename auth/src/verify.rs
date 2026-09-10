@@ -1,12 +1,13 @@
-// Verification of the incoming Dex identity token.
+// Token verification: the incoming identity bearer, whether Dex-issued (the
+// get-token.sh path) or one we minted ourselves (native login / a forwarded
+// exchanged token).
 //
-// The client presents its Dex-issued token as the bearer credential on the
-// exchange call. Before minting a Lore token for that identity we verify the Dex
-// token's signature (against Dex's JWKS), issuer, audience and expiry, so a
-// forged or foreign bearer cannot obtain a repository-scoped Lore token.
-//
-// The JWKS is fetched via OIDC discovery against the issuer and cached; a token
-// whose `kid` is not cached triggers a single refetch (covering key rotation).
+// Before minting a repository-scoped token for an identity we verify the
+// bearer's signature, issuer, audience and expiry, so a forged or foreign bearer
+// cannot obtain access. `DexVerifier` checks Dex-signed tokens against Dex's JWKS
+// (fetched via OIDC discovery and cached; an unknown `kid` triggers one refetch,
+// covering key rotation); `SelfVerifier` checks tokens we signed against our own
+// key; `Identity` tries ours first, then Dex.
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
@@ -20,10 +21,11 @@ use jsonwebtoken::Validation;
 use serde::Deserialize;
 use tokio::sync::RwLock;
 
-/// The claims we read off a verified Dex token. `sub`/`exp` carry into the minted
-/// Lore token; the optional display fields populate the exchange response.
+/// The identity claims we read off a verified token, whether a Dex identity
+/// token or one we minted ourselves. `sub`/`exp` carry into the minted Lore
+/// token; the optional display fields populate the exchange response.
 #[derive(Deserialize, Debug)]
-pub struct DexClaims {
+pub struct IdentityClaims {
     pub sub: String,
     pub exp: u64,
     #[serde(default)]
@@ -78,7 +80,7 @@ impl DexVerifier {
 
     /// Verify a Dex bearer token, refetching the JWKS once if the token's key id
     /// is not already cached.
-    pub async fn verify(&self, token: &str) -> Result<DexClaims, VerifyError> {
+    pub async fn verify(&self, token: &str) -> Result<IdentityClaims, VerifyError> {
         let kid = decode_header(token)
             .map_err(|e| VerifyError::Malformed(e.to_string()))?
             .kid
@@ -130,38 +132,39 @@ impl SelfVerifier {
         })
     }
 
-    /// The `sub` of a token we signed, or `None` if it is not one of ours (wrong
-    /// signature/issuer/audience or expired).
-    pub fn subject(&self, token: &str) -> Option<String> {
+    /// The identity claims of a token we signed, or `None` if it is not one of
+    /// ours (wrong signature/issuer/audience or expired).
+    pub fn claims(&self, token: &str) -> Option<IdentityClaims> {
         let mut v = Validation::new(Algorithm::RS256);
         v.set_issuer(&[self.issuer.as_str()]);
         v.set_audience(&[self.audience.as_str()]);
         v.validate_exp = true;
-        decode::<SubClaim>(token, &self.key, &v)
+        decode::<IdentityClaims>(token, &self.key, &v)
             .ok()
-            .map(|d| d.claims.sub)
+            .map(|d| d.claims)
     }
 }
 
-#[derive(Deserialize)]
-struct SubClaim {
-    sub: String,
-}
-
-/// Resolves the authenticated subject from whatever bearer loreserver forwards
-/// to the ReBAC RPCs: a token we signed (the exchanged authz token) or a raw Dex
-/// identity token. Both are verified; an unverifiable bearer yields an error.
+/// Resolves the authenticated identity from whatever bearer we are handed: a
+/// token we signed (an authn token from native login, or an exchanged authz
+/// token loreserver forwards) or a raw Dex identity token (the get-token.sh
+/// path). Both are verified; an unverifiable bearer yields an error.
 pub struct Identity {
     pub self_verifier: SelfVerifier,
     pub dex: Arc<DexVerifier>,
 }
 
 impl Identity {
-    pub async fn subject(&self, bearer: &str) -> Result<String, VerifyError> {
-        if let Some(sub) = self.self_verifier.subject(bearer) {
-            return Ok(sub);
+    /// The full identity claims, trying our own key first, then Dex.
+    pub async fn claims(&self, bearer: &str) -> Result<IdentityClaims, VerifyError> {
+        if let Some(claims) = self.self_verifier.claims(bearer) {
+            return Ok(claims);
         }
-        Ok(self.dex.verify(bearer).await?.sub)
+        self.dex.verify(bearer).await
+    }
+
+    pub async fn subject(&self, bearer: &str) -> Result<String, VerifyError> {
+        Ok(self.claims(bearer).await?.sub)
     }
 }
 
@@ -172,7 +175,7 @@ pub fn verify_with_jwks(
     jwks: &JwkSet,
     issuer: &str,
     audience: &str,
-) -> Result<DexClaims, VerifyError> {
+) -> Result<IdentityClaims, VerifyError> {
     let kid = decode_header(token)
         .map_err(|e| VerifyError::Malformed(e.to_string()))?
         .kid
@@ -192,7 +195,7 @@ pub fn verify_with_jwks(
     validation.set_audience(&[audience]);
     validation.validate_exp = true;
 
-    decode::<DexClaims>(token, &key, &validation)
+    decode::<IdentityClaims>(token, &key, &validation)
         .map(|data| data.claims)
         .map_err(|e| VerifyError::Invalid(e.to_string()))
 }
