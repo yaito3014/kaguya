@@ -28,22 +28,29 @@ OIDC id token carries none, which is why `kaguya-auth` re-issues it.
 
 ## Build the images
 
-Neither image is published, so build both. The loreserver build needs several GB
-of RAM; build on a bigger machine and transfer if this VPS is small. `kaguya-auth`
-builds from `./auth` in this repo.
+CI (`.github/workflows/images.yml`) builds all three images and publishes them to
+GHCR; the VPS only pulls.
 
-    # loreserver, from upstream source
-    git clone https://github.com/EpicGames/lore
-    cd lore
-    docker build --platform linux/amd64 -f lore-server/Dockerfile -t loreserver:v0.9.0 .
-    cd -
+- **kaguya-auth / kaguya-web** build on every push to `main` that touches
+  `auth/` or `web/`, tagged with the `version` in that crate's `Cargo.toml`.
+  An existing tag is never overwritten, so to release: bump `version`, bump the
+  matching tag in `docker-compose.yml`, commit both together.
+- **loreserver** builds from upstream `EpicGames/lore` on demand (it needs
+  several GB of RAM, which GitHub's runners have). Run the workflow by hand with
+  `lore_ref` set to the upstream tag (e.g. `v0.9.0`), then bump the tag in
+  `docker-compose.yml`. Re-check `lore/local.toml.tmpl` against the new release.
 
-    # kaguya-auth and the web frontend, from this repo
-    docker build --platform linux/amd64 -t kaguya-auth:0.2.0 ./auth
-    docker build --platform linux/amd64 -t kaguya-web:0.1.0 ./web
+GHCR packages start out private. Either make each package public once
+(package settings → visibility) or `docker login ghcr.io` on the VPS with a
+read-only (`read:packages`) token.
 
-    # if built elsewhere, load them onto this VPS:
-    #   docker save loreserver:v0.9.0 kaguya-auth:0.2.0 kaguya-web:0.1.0 | ssh kaguya 'docker load'
+To build by hand instead, tag the images with the same `ghcr.io/...` names:
+
+    docker build --platform linux/amd64 -t ghcr.io/yaito3014/kaguya-auth:0.2.0 ./auth
+    docker build --platform linux/amd64 -t ghcr.io/yaito3014/kaguya-web:0.1.0 ./web
+    # loreserver: from a clone of github.com/EpicGames/lore
+    docker build --platform linux/amd64 -f lore-server/Dockerfile \
+        -t ghcr.io/yaito3014/loreserver:v0.9.0 .
 
 `kaguya-auth` generates its RSA signing key on first start and persists it in the
 `auth-keys` volume; it writes the public JWKS there too, and loreserver reads it
@@ -116,6 +123,52 @@ Setup:
 
 Scope is read-only browsing (repositories now; branches/history/tree/file view as
 it grows). There is no push from the web.
+
+## Automated updates
+
+Updates are pull-based: nothing outside this VPS can push to it.
+
+- **Images:** [Renovate](https://github.com/apps/renovate) opens PRs that bump
+  the image tags and digests pinned in `docker-compose.yml` (see `renovate.json`).
+  Patch, minor and digest bumps merge automatically once CI passes. Major bumps,
+  and Headscale/Authentik feature releases, wait for you and are marked
+  `[manual-deploy]`.
+- **Deploy:** a nightly `kaguya-update` timer runs `ops/update.sh`. It
+  fast-forwards to `origin/main`, pulls the images, backs up (`ops/stack.sh`),
+  restarts, and health-checks. If the checks fail it rolls back to the previous
+  commit and does not retry that commit. It does not deploy commits marked
+  `[manual-deploy]`, or commits that change `*.tmpl`, `.env.example` or
+  `setup.sh`; it sends a reminder each night instead.
+- **OS:** unattended security upgrades, with a reboot at 05:20 if one is
+  needed. Docker is held back, because upgrading the engine restarts every
+  container.
+
+Setup, once per VPS: install the Renovate GitHub app on this repo, add
+`UPDATE_NOTIFY_URL` to `.env` (optional; an [ntfy](https://ntfy.sh) topic URL
+works), then:
+
+    sudo ops/install.sh               # timer at 03:00 + unattended-upgrades
+    systemctl list-timers kaguya-update  # next run
+    journalctl -u kaguya-update          # past runs
+
+For a `[manual-deploy]` change: read the upstream notes, do any manual steps,
+then run `ops/update.sh --force`. For a new loreserver, re-check
+`lore/local.toml.tmpl` first.
+
+A change to `*.tmpl`, `.env.example` or `setup.sh` is always deployed by hand,
+because `update.sh` never re-renders configs: `git pull`, `./setup.sh`, then
+`docker compose pull && docker compose up -d`.
+
+Backups go to `/var/backups/kaguya/<time>-<previous commit>/` (newest 5 kept;
+local only, so copy them off the host yourself). Rollback never restores data.
+If a one-way migration ran and the old version cannot start, restore by hand
+from that directory:
+
+    docker compose stop lore auth
+    # likewise auth-keys.tgz -> auth:/keys and auth-data.tgz -> auth:/data
+    docker run --rm -i --volumes-from "$(docker compose ps -aq lore)" busybox:1.37 \
+        sh -c 'rm -rf /data/* && tar xzf - -C /data' < lore-data.tgz
+    docker compose up -d
 
 ## Notes
 
