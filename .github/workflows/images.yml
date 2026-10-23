@@ -1,0 +1,74 @@
+# Build and publish the stack's images to GHCR; the VPS only pulls (see README).
+#  - kaguya-auth / kaguya-web: on push to main, tagged with their Cargo.toml
+#    version. An existing tag is never overwritten: bump the version to release.
+#  - loreserver: on manual dispatch, from upstream EpicGames/lore at `lore_ref`.
+name: images
+
+on:
+  push:
+    branches: [main]
+    paths: ["auth/**", "web/**", ".github/workflows/images.yml"]
+  workflow_dispatch:
+    inputs:
+      lore_ref:
+        description: "EpicGames/lore tag to build loreserver from (empty = skip)"
+        default: ""
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  kaguya:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        component: [auth, web]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Resolve tag
+        id: tag
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' ${{ matrix.component }}/Cargo.toml | head -n 1)
+          image=ghcr.io/${{ github.repository_owner }}/kaguya-${{ matrix.component }}:$version
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          if docker manifest inspect "$image" >/dev/null 2>&1; then
+            echo "$image already published; bump the version in Cargo.toml to release"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.tag.outputs.exists != 'true'
+        uses: docker/setup-buildx-action@v3
+      - if: steps.tag.outputs.exists != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.component }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.tag.outputs.image }}
+
+  loreserver:
+    if: github.event_name == 'workflow_dispatch' && inputs.lore_ref != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: EpicGames/lore
+          ref: ${{ inputs.lore_ref }}
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: lore-server/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/loreserver:${{ inputs.lore_ref }}

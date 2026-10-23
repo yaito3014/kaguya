@@ -4,3 +4,7 @@ caddy/Caddyfile
 lore/local.toml
 auth/target
 web/target
+
+# ops/update.sh runtime state
+.update-failed
+.update.lock
