@@ -23,7 +23,7 @@ services:
       - caddy-config:/config
 
   auth:
-    image: ghcr.io/yaito3014/kaguya-auth:0.2.0    # built by CI from ./auth (see README)
+    image: ghcr.io/yaito3014/kaguya-auth:0.2.0@sha256:a5cca814f286fa1478783f416a0c11ad7e825d5abab6e4ad19356c02ab9639b2    # built by CI from ./auth (see README)
     restart: unless-stopped
     # Verifies the caller's OIDC id token and mints a repository-scoped Lore token
     # signed with its own key; also serves the all-allow ReBAC API. It never
@@ -52,7 +52,7 @@ services:
       start_period: 5s
 
   lore:
-    image: ghcr.io/yaito3014/loreserver:v0.9.0    # built by CI from EpicGames/lore; see README
+    image: ghcr.io/yaito3014/loreserver:v0.9.0@sha256:4fdeab9f83e8735916cb8a7039e780802ec2f125e045cf0c0ee58df3a6d1ea00    # built by CI from EpicGames/lore; see README
     restart: unless-stopped
     depends_on:
       caddy:
@@ -69,7 +69,7 @@ services:
       - auth-keys:/keys:ro     # JWKS for verifying exchanged tokens (file:// in local.toml)
 
   web:
-    image: ghcr.io/yaito3014/kaguya-web:0.1.0    # built by CI from ./web (see README)
+    image: ghcr.io/yaito3014/kaguya-web:0.1.0@sha256:bad71085d1326a93f0b15c883d91a694d77281701fcfb543e99ad3e2c5d8c7a6    # built by CI from ./web (see README)
     restart: unless-stopped
     # Read-only web frontend (BFF). The browser reaches it via Caddy on
     # LORE_WEB_HOST; it is internal only (no published ports). It logs users in
