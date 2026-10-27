@@ -9,7 +9,7 @@ tonic-prost = "0.14.2"
 prost = "0.14.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 axum = "0.8"
-tower-http = { version = "0.6", features = ["fs"] }
+tower-http = { version = "0.7", features = ["fs"] }
 reqwest = { version = "0.12", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
