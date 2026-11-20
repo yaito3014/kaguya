@@ -1,4 +1,4 @@
-FROM rust:slim@sha256:1a939748a7cbab172de91a014e3804a97af1394a8c844faa67fce9401c4e40fb AS builder
+FROM rust:slim@sha256:6f14b2b4b278ec0d50aa1d69541c304ce0f95e0f6268487aa9924af1c2e9aebe AS builder
 # protobuf-compiler: build.rs codegen. build-essential: C toolchain for ring
 # (jsonwebtoken). pkg-config + libssl-dev: link native-tls (reqwest -> the IdP's JWKS).
 RUN apt-get update && apt-get install -y \
