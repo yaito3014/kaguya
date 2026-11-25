@@ -1,4 +1,4 @@
-FROM rust:slim@sha256:6f14b2b4b278ec0d50aa1d69541c304ce0f95e0f6268487aa9924af1c2e9aebe AS builder
+FROM rust:slim@sha256:3b199fd6db7d709274df56565b8f4003f9e30d7bfcff9d53148c86053b7855e2 AS builder
 # protobuf-compiler: build.rs gRPC codegen. build-essential + pkg-config +
 # libssl-dev: link native-tls (reqwest -> the OIDC provider over HTTPS).
 RUN apt-get update && apt-get install -y \
